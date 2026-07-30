@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- runtime artefacts (belong in the user profile, never in the repo) ---
+_crash.log
+_session.alive
+_stats.jsonl
+_streaming_debug.log
+settings.ini
+replacements.json
+dictionary.txt
+history/
+models/
+icons/
+
+# --- work-in-progress leftovers ---
+*.bak
+*.t[0-9][0-9][0-9]bak
+_smoke_*
+_bench_*
+_repro_*
+
+# --- audio / transcripts (personal data, must not be committed) ---
+*.wav
+*.mp3
+*.f32raw
+*.raw
+*.callmeta.json
+
+# --- editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

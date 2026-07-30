@@ -1,0 +1,38 @@
+# Точные версии, на которых iwhisper проверен (Windows 10, Python 3.12,
+# NVIDIA GTX 1060 / CUDA 12.x). pyproject.toml держит нижние границы для
+# установки как пакета; этот файл — воспроизводимая среда для разработки.
+#
+#   pip install --user -r requirements.txt
+#
+# ffmpeg сюда не входит и в поставку не идёт: готовые сборки под GPL, бандлинг
+# утянул бы весь проект в GPL. Нужен только для MP3-архива записанного созвона —
+# без него сохраняется WAV.
+
+# --- ядро транскрипции ---
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+huggingface_hub==1.12.0
+tokenizers==0.22.2
+onnxruntime==1.25.1          # VAD-фильтр Silero внутри faster-whisper
+av==17.0.1                   # чтение аудио-файлов в faster-whisper
+tqdm==4.67.3                 # прогресс скачивания весов
+
+# --- аудио ---
+numpy==2.4.4
+scipy==1.17.1                # resample_poly для ресэмпла loopback-канала
+sounddevice==0.5.5           # захват микрофона
+PyAudioWPatch==0.2.12.8      # WASAPI loopback (звук системы), только Windows
+
+# --- интерфейс ---
+PySide6==6.11.1
+shiboken6==6.11.1
+pillow==12.2.0               # генерация иконок трея
+pyperclip==1.11.0            # вставка результата в активное окно
+
+# --- опционально ---
+winotify==1.1.0              # тосты Windows; без него приложение просто молчит
+
+# --- CUDA-рантайм из pip (если своего тулкита нет) ---
+# Раскомментируйте, если ctranslate2 не находит cublas/cudnn:
+# nvidia-cublas-cu12==12.9.2.10
+# nvidia-cudnn-cu12==9.21.1.3

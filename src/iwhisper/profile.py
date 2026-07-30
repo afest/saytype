@@ -1,0 +1,259 @@
+"""profile.py — где приложение хранит данные пользователя.
+
+Один модуль отвечает на вопрос «куда писать», чтобы в остальном коде не было ни
+одного пути с буквой диска. Всё лежит под ``%LOCALAPPDATA%\\iwhisper`` (Windows)
+или ``~/.local/share/iwhisper`` (остальные платформы):
+
+    settings.ini        настройки приложения (QSettings IniFormat)
+    dictionary.txt      словарь: слова, имена и термины, которые модель путает
+    replacements.json   правила замен в готовом тексте
+    models/             скачанные веса (владелец — engine.py)
+    icons/              иконки трея, генерируются при первом запуске
+    runtime/            маркер живой сессии и журнал аварий
+    history/            история записей по умолчанию (меняется в настройках)
+
+Словарь и замены — **данные, а не константы**: из коробки пусты, наполняет
+пользователь. Модуль не тянет ни PySide6, ни faster-whisper: его импортируют и
+UI-слой, и CLI.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+APP_DIR_NAME = "iwhisper"
+
+# Бюджет `initial_prompt` у Whisper — max_length // 2 - 1 токенов. Лишнее
+# отрезается МОЛЧА и С НАЧАЛА строки: первые слова словаря просто перестают
+# работать, без ошибки и без следа в логе.
+PROMPT_TOKEN_BUDGET = 223
+
+# Подпапка истории под транскрипты созвонов. Регистр как был: на Windows он не
+# влияет на разрешение пути, а у существующих пользователей папка уже создана.
+CALLS_SUBDIR = "Calls"
+
+_REPLACEMENTS_VERSION = 1
+
+
+def profile_dir() -> Path:
+    """Корень пользовательских данных. Создаётся при первом обращении."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    path = Path(base) / APP_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def settings_file() -> Path:
+    return profile_dir() / "settings.ini"
+
+
+def default_history_dir() -> Path:
+    """Куда писать записи, пока пользователь не выбрал свою папку."""
+    return profile_dir() / "history"
+
+
+def icons_dir() -> Path:
+    """Иконки трея. Генерируются кодом, поэтому лежат в профиле, а не в пакете:
+    установленный пакет может быть в папке без права записи."""
+    path = profile_dir() / "icons"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def runtime_dir() -> Path:
+    """Маркер живой сессии и журнал аварий — по той же причине не в пакете."""
+    path = profile_dir() / "runtime"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# === Миграция с прежнего расположения настроек ===
+
+_LEGACY_SETTINGS_SUBDIR = "faster-whisper-ui"
+
+
+def legacy_settings_file() -> "Path | None":
+    """``%APPDATA%\\faster-whisper-ui\\settings.ini`` — где настройки жили до
+    того, как у приложения появилось имя. Возвращает путь, если файл есть."""
+    if sys.platform != "win32":
+        return None
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    candidate = Path(appdata) / _LEGACY_SETTINGS_SUBDIR / "settings.ini"
+    return candidate if candidate.exists() else None
+
+
+def migrate_legacy_settings() -> "str | None":
+    """Скопировать старый settings.ini в профиль, если своего ещё нет.
+
+    Копия, а не перемещение: пока новая версия не подтверждена, старый файл
+    остаётся рабочим откатом. Возвращает описание для лога либо None.
+    """
+    target = settings_file()
+    if target.exists():
+        return None
+    legacy = legacy_settings_file()
+    if legacy is None:
+        return None
+    try:
+        shutil.copy2(legacy, target)
+    except OSError as exc:
+        return f"миграция настроек не удалась: {exc}"
+    return f"настройки перенесены из {legacy}"
+
+
+# === Словарь (initial_prompt) ===
+
+def dictionary_path() -> Path:
+    return profile_dir() / "dictionary.txt"
+
+
+def load_dictionary() -> str:
+    """Словарь пользователя одной строкой. Пусто — если файла нет.
+
+    Файл читается как обычный текст: переводы строк схлопываются в пробелы,
+    потому что Whisper принимает `initial_prompt` одной строкой, а человеку
+    удобнее держать словарь в несколько строк. Строки, начинающиеся с `#`, —
+    комментарии.
+    """
+    path = dictionary_path()
+    if not path.exists():
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    return " ".join(lines).strip()
+
+
+def save_dictionary(text: str) -> None:
+    path = dictionary_path()
+    try:
+        path.write_text((text or "").strip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """Оценка длины промпта в токенах без загрузки модели.
+
+    Нужна только для счётчика в настройках, когда модель ещё не в памяти.
+    Точное число даёт `engine.count_prompt_tokens` через токенизатор модели;
+    здесь — приближение по эмпирике мультиязычного BPE Whisper: на русском
+    ~2.5 знака на токен, на латинице и цифрах ~4.
+    """
+    if not text:
+        return 0
+    cyrillic = sum(1 for ch in text if "Ѐ" <= ch <= "ӿ")
+    other = len(text) - cyrillic
+    return int(cyrillic / 2.5 + other / 4.0 + 0.5)
+
+
+# === Замены в готовом тексте ===
+
+def replacements_path() -> Path:
+    return profile_dir() / "replacements.json"
+
+
+def default_replacement_rules() -> list:
+    """Из коробки — пусто. Приложение не знает, какие слова путает именно у вас."""
+    return []
+
+
+def load_replacement_rules() -> list:
+    """Список правил ``{"pattern", "replacement", "tail_only"}``.
+
+    ``tail_only`` — правило применяется только к концу текста (`$`-анкер
+    дописывается автоматически). Битый файл не должен ронять транскрипцию,
+    поэтому любая ошибка чтения = пустой список.
+    """
+    path = replacements_path()
+    if not path.exists():
+        return default_replacement_rules()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default_replacement_rules()
+    raw = data.get("rules") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return default_replacement_rules()
+    rules = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pattern = str(item.get("pattern", "")).strip()
+        if not pattern:
+            continue
+        rules.append({
+            "pattern": pattern,
+            "replacement": str(item.get("replacement", "")),
+            "tail_only": bool(item.get("tail_only", False)),
+        })
+    return rules
+
+
+def save_replacement_rules(rules: list) -> None:
+    payload = {
+        "version": _REPLACEMENTS_VERSION,
+        "rules": [
+            {
+                "pattern": r.get("pattern", ""),
+                "replacement": r.get("replacement", ""),
+                "tail_only": bool(r.get("tail_only", False)),
+            }
+            for r in rules
+            if str(r.get("pattern", "")).strip()
+        ],
+    }
+    try:
+        replacements_path().write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def validate_pattern(pattern: str) -> "tuple[bool, str]":
+    """Компилируется ли регулярка. Сообщение — для показа в редакторе."""
+    if not pattern.strip():
+        return False, "пустой шаблон"
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def compile_rules(rules: "list | None" = None) -> "tuple[list, list]":
+    """Скомпилировать правила в две группы: обычные и хвостовые.
+
+    Возвращает ``(body, tail)``, где элемент — ``(compiled_regex, replacement)``.
+    Невалидные шаблоны пропускаются молча: пользователь мог править файл руками,
+    и одна опечатка не должна оставить его без транскрипта.
+    """
+    if rules is None:
+        rules = load_replacement_rules()
+    body, tail = [], []
+    for rule in rules:
+        pattern = rule.get("pattern", "")
+        replacement = rule.get("replacement", "")
+        target = tail if rule.get("tail_only") else body
+        # Хвостовое правило анкерится на конец текста, если автор не сделал это сам.
+        if rule.get("tail_only") and not pattern.rstrip().endswith("$"):
+            pattern = pattern + r"\s*$"
+        try:
+            target.append((re.compile(pattern), replacement))
+        except re.error:
+            continue
+    return body, tail

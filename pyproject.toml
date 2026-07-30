@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iwhisper"
+version = "0.1.0"
+description = "GPU-accelerated system-wide dictation and call recording for Windows, built on faster-whisper"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "iwhisper contributors" }]
+keywords = ["whisper", "speech-to-text", "dictation", "transcription", "windows", "cuda"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# Нижние границы, а не точные версии: в pyproject фиксировать точку — значит
+# ломать сборку у любого, у кого стек чуть свежее. Точные версии, на которых
+# всё проверено, лежат в requirements.txt.
+dependencies = [
+    "faster-whisper>=1.2",
+    "ctranslate2>=4.6",
+    "huggingface_hub>=0.30",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "sounddevice>=0.5",
+    "PyAudioWPatch>=0.2.12.8",
+    "PySide6>=6.7",
+    "pyperclip>=1.9",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# Уведомления Windows. Не обязательны: без них приложение просто молчит.
+notify = ["winotify>=1.1"]
+# CUDA-рантайм из pip-пакетов NVIDIA. Нужен, только если своего CUDA-тулкита нет;
+# `engine.setup_cuda_dll_paths()` подключает эти папки к DLL search на Windows.
+cuda = ["nvidia-cublas-cu12>=12.4", "nvidia-cudnn-cu12>=9.0"]
+
+[project.scripts]
+iwhisper-call = "iwhisper.transcribe_call:main"
+
+[project.gui-scripts]
+iwhisper = "iwhisper.transcribe_ui:run"
+
+[project.urls]
+Source = "https://github.com/afest/iwhisper"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+iwhisper = ["assets/*"]
