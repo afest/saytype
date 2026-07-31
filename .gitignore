@@ -8,6 +8,9 @@ dist/
 .venv/
 venv/
 
+# --- пакеты Velopack (сотни мегабайт, место им в GitHub Releases) ---
+Releases/
+
 # --- runtime artefacts (belong in the user profile, never in the repo) ---
 _crash.log
 _session.alive

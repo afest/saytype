@@ -37,9 +37,20 @@ dependencies = [
     "PySide6>=6.7",
     "pyperclip>=1.9",
     "pillow>=10",
+    # Разбор и валидация hotkey-строк (`<ctrl>+<shift>+q`). Сам перехват идёт
+    # через RegisterHotKey, но формат и парсер — из pynput.
+    "pynput>=1.7",
 ]
 
+[dependency-groups]
+# Только для сборки дистрибутива, в само приложение не попадает.
+build = ["pyinstaller>=6.10"]
+test = ["pytest>=8"]
+
 [project.optional-dependencies]
+# Обновление установленной версии. Из исходников не используется — `updater`
+# сам себя выключает, когда приложение запущено не из установки.
+update = ["velopack>=1.2"]
 # Уведомления Windows. Не обязательны: без них приложение просто молчит.
 notify = ["winotify>=1.1"]
 # CUDA-рантайм из pip-пакетов NVIDIA. Нужен, только если своего CUDA-тулкита нет;

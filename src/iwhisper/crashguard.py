@@ -141,12 +141,16 @@ def collect_context(prev: dict, base_dir: Path | None = None) -> list[str]:
     try:
         # Код и маркер лежат в разных местах (пакет vs профиль пользователя),
         # поэтому mtime берём у своего модуля, а не относительно base_dir.
-        code = Path(__file__).resolve().parent / "transcribe_ui.py"
+        # В собранном виде исходников на диске нет — там улика это сам exe.
+        if getattr(sys, "frozen", False):
+            code = Path(sys.executable)
+        else:
+            code = Path(__file__).resolve().parent / "transcribe_ui.py"
         st = code.stat()
         mtime = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
-        out.append(f"transcribe_ui.py: изменён {mtime}, {st.st_size} байт")
+        out.append(f"{code.name}: изменён {mtime}, {st.st_size} байт")
     except Exception as exc:
-        out.append(f"transcribe_ui.py: не удалось прочитать ({exc!r})")
+        out.append(f"версия кода: не удалось прочитать ({exc!r})")
 
     try:
         out.append(f"VRAM: {_free_vram()}")

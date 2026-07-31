@@ -26,8 +26,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from . import cuda_layer  # T-261: докачиваемый CUDA-рантайм (строка «Ускорение GPU»)
 from . import engine  # T-259: пресеты моделей, валидация «своей модели», учёт места
 from . import profile  # где лежат настройки, словарь и замены
+from . import updater  # T-262: проверка обновлений через Velopack
 
 from PySide6.QtCore import Qt, QSettings, QUrl, QSize, QMargins, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon
@@ -94,6 +96,7 @@ DEFAULT_PROCESSING_MODE = "auto"
 DEFAULT_AUTO_THRESHOLD_SEC = 10
 DEFAULT_PRE_ROLL_ENABLED = False  # T-164: rolling 500мс ДО hotkey (always-on mic, дефолт OFF)
 DEFAULT_KEEP_CALL_AUDIO = False   # T-174: хранить MP3 созвона (дефолт OFF — нужен только транскрипт)
+DEFAULT_CHECK_UPDATES = True      # T-262: фоновая проверка обновлений (выключаемая в настройках)
 DEFAULT_CALL_AUDIO_KEEP = 2       # T-175: сколько последних WAV созвонов держать в Calls\ (буфер «вернуться»)
 # T-259: модель транскрипции. `model` = ключ пресета из engine.PRESETS либо
 # "custom"; при "custom" значение берётся из `custom_model` (HF repo id или путь
@@ -435,6 +438,12 @@ def load_settings_dict() -> dict:
         "call_audio_keep": max(1, int(s.value("call_audio_keep", DEFAULT_CALL_AUDIO_KEEP))),
         "speaker_self": s.value("speaker_self", DEFAULT_SPEAKER_SELF, type=str) or DEFAULT_SPEAKER_SELF,
         "speaker_other": s.value("speaker_other", DEFAULT_SPEAKER_OTHER, type=str) or DEFAULT_SPEAKER_OTHER,
+        # T-261: пользователь отказался от докачки CUDA-слоя. Спрашиваем один
+        # раз: повторять предложение на каждом старте — навязчиво, вернуться к
+        # нему можно кнопкой в настройках.
+        "cuda_layer_declined": _as_bool(s.value("cuda_layer_declined", False)),
+        # T-262: фоновая проверка обновлений при старте
+        "check_updates": _as_bool(s.value("check_updates", DEFAULT_CHECK_UPDATES)),
         # Словарь — отдельный файл в профиле, а не значение ini: пользователь
         # правит его руками и делится им, а QSettings экранирует не-ASCII.
         "dictionary": profile.load_dictionary(),
@@ -471,6 +480,9 @@ def save_settings_dict(d: dict) -> None:
                or DEFAULT_SPEAKER_SELF)
     s.setValue("speaker_other", (d.get("speaker_other") or DEFAULT_SPEAKER_OTHER).strip()
                or DEFAULT_SPEAKER_OTHER)
+    if "cuda_layer_declined" in d:
+        s.setValue("cuda_layer_declined", bool(d["cuda_layer_declined"]))
+    s.setValue("check_updates", bool(d.get("check_updates", DEFAULT_CHECK_UPDATES)))
     s.sync()
     if "dictionary" in d:
         profile.save_dictionary(d.get("dictionary") or "")
@@ -489,25 +501,37 @@ def autostart_shortcut_exists() -> bool:
 
 
 def create_autostart_shortcut(target_script: Path | None = None) -> tuple[bool, str]:
-    """Создать ярлык на `pythonw.exe -m iwhisper` в shell:startup.
+    """Создать ярлык автозапуска в shell:startup.
 
-    Запускаем пакет модулем, а не файлом: внутри пакета относительные импорты, и
-    прямой запуск `transcribe_ui.py` файлом их не разрешит. `target_script`
-    оставлен для совместимости вызовов и используется только как рабочая папка.
+    Из исходников запускаем пакет модулем, а не файлом: внутри пакета
+    относительные импорты, и прямой запуск `transcribe_ui.py` файлом их не
+    разрешит. `target_script` оставлен для совместимости вызовов и используется
+    только как рабочая папка.
+
+    В собранном виде (`sys.frozen`) целью становится сам `iwhisper.exe` без
+    аргументов: `-m iwhisper` бутлоадер PyInstaller не понимает и передал бы
+    строку приложению как argv — автозапуск молча ломался бы (T-261).
 
     Возвращает (success, message). message — пояснение для UI на случай fail.
     """
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    if not pythonw.exists():
-        pythonw = Path(sys.executable)
+    frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        target = Path(sys.executable)
+        arguments = ""
+        working_dir = target.parent
+    else:
+        target = Path(sys.executable).with_name("pythonw.exe")
+        if not target.exists():
+            target = Path(sys.executable)
+        arguments = "-m iwhisper"
+        working_dir = (target_script or Path(__file__).resolve()).parent
     STARTUP_DIR.mkdir(parents=True, exist_ok=True)
     shortcut_path = STARTUP_DIR / STARTUP_SHORTCUT_NAME
-    working_dir = (target_script or Path(__file__).resolve()).parent
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$lnk = $ws.CreateShortcut('{shortcut_path}'); "
-        f"$lnk.TargetPath = '{pythonw}'; "
-        "$lnk.Arguments = '-m iwhisper'; "
+        f"$lnk.TargetPath = '{target}'; "
+        f"$lnk.Arguments = '{arguments}'; "
         f"$lnk.WorkingDirectory = '{working_dir}'; "
         "$lnk.WindowStyle = 7; "
         "$lnk.Save()"
@@ -1983,9 +2007,16 @@ class SettingsDialog(QDialog):
     - Footer (hairline сверху): note слева + Cancel (outline pill) + OK (черный pill).
     """
 
+    # T-262: итог фоновой проверки обновлений приходит из рабочего потока
+    update_checked = Signal(object, str)  # UpdateInfo | None, текст ошибки ("" — успех)
+
     def __init__(self, parent: QMainWindow | None, current: dict, model_locked: bool = False) -> None:
         super().__init__(parent)
+        self.update_checked.connect(self._on_update_checked)
         self._model_locked = bool(model_locked)  # T-259: идёт запись/транскрипция
+        # T-261: прежний отказ от CUDA-слоя и запрос скачивания из этого диалога
+        self._cuda_declined = bool(current.get("cuda_layer_declined", False))
+        self._cuda_requested = False
         self.setWindowTitle("Настройки iWhisper")
         self.setMinimumWidth(560)
         # Dialog-локальный стиль — переопределяет глобальный QPushButton (он pill для primary).
@@ -2188,6 +2219,17 @@ class SettingsDialog(QDialog):
             "Нужен ffmpeg в PATH — без него MP3 просто не создаётся."
         )
 
+        # T-262: автопроверка обновлений. Выключаемая сознательно — часть
+        # аудитории выбирает оффлайн-инструменты именно за отсутствие сетевой
+        # активности, и «тихий» выход в интернет по своей воле их не устроит.
+        self.updates_box = QCheckBox()
+        self.updates_box.setChecked(bool(current.get("check_updates", True)))
+        self.updates_box.setToolTip(
+            "При запуске приложение в фоне спрашивает у сервера обновлений, нет ли "
+            "новой версии, и показывает ненавязчивое уведомление. Выключено — в сеть "
+            "само не ходит; проверить вручную можно кнопкой ниже."
+        )
+
         # T-175: размер ротируемого буфера WAV созвонов в Calls\ (durability-страховка
         # «вернуться» — переслушать / дотранскрибировать). Аналог «Количество записей»
         # надиктовок, но для созвонов; дефолт 2.
@@ -2324,6 +2366,35 @@ class SettingsDialog(QDialog):
         gmd.addWidget(model_hint, 1, 1)
         body_v.addLayout(gmd)
 
+        # frow_cuda: ускорение GPU — докачиваемый CUDA-слой (T-261).
+        # Строка есть всегда, но на машине без NVIDIA она честно говорит, что
+        # качать нечего: иначе «почему у меня медленно» остаётся без ответа.
+        gcu = _QGrid()
+        gcu.setContentsMargins(0, 0, 0, 0)
+        gcu.setHorizontalSpacing(8)
+        gcu.setVerticalSpacing(4)
+        gcu.setColumnMinimumWidth(0, 150)
+        gcu.setColumnStretch(1, 1)
+        lbl_cuda = QLabel("Ускорение GPU:")
+        lbl_cuda.setObjectName("frow_label")
+        gcu.addWidget(lbl_cuda, 0, 0)
+        self.cuda_value_label = QLabel()
+        self.cuda_value_label.setStyleSheet(
+            "font-size: 13px; font-weight: 500; color: #18181B; background: transparent;"
+        )
+        gcu.addWidget(self.cuda_value_label, 0, 1)
+        self.cuda_btn = QPushButton()
+        self.cuda_btn.setObjectName("btn_outline")
+        self.cuda_btn.setCursor(Qt.PointingHandCursor)
+        self.cuda_btn.clicked.connect(self._on_cuda_button)
+        gcu.addWidget(self.cuda_btn, 0, 2)
+        self.cuda_hint = QLabel()
+        self.cuda_hint.setObjectName("frow_hint")
+        self.cuda_hint.setWordWrap(True)
+        gcu.addWidget(self.cuda_hint, 1, 1)
+        body_v.addLayout(gcu)
+        self._refresh_cuda_row()
+
         # frow_dict: словарь пользователя + счётчик бюджета промпта
         gdc = _QGrid()
         gdc.setContentsMargins(0, 0, 0, 0)
@@ -2415,7 +2486,40 @@ class SettingsDialog(QDialog):
         checks_lay.addWidget(_make_check_row(self.startmin_box, "Запускать свёрнутым в tray", "(без открытого окна)"))
         checks_lay.addWidget(_make_check_row(self.preroll_box, "Pre-roll буфер (500мс ДО hotkey)", "(всегда-on микрофон, устраняет потерю первых слов)"))
         checks_lay.addWidget(_make_check_row(self.keep_call_audio_box, "Хранить аудио созвона (MP3)", "(по умолч. только транскрипт в Calls\\)"))
+        checks_lay.addWidget(_make_check_row(self.updates_box, "Проверять обновления автоматически", "(выключено — приложение не выходит в сеть само)"))
         body_v.addLayout(checks_lay)
+
+        # frow_version: версия + ручная проверка обновлений (T-262).
+        # Ручная проверка живёт рядом с галкой автопроверки, но работает и при
+        # выключенной: человек сам решил сходить в сеть — это не фоновая активность.
+        gv = _QGrid()
+        gv.setContentsMargins(0, 8, 0, 0)
+        gv.setHorizontalSpacing(8)
+        gv.setVerticalSpacing(4)
+        gv.setColumnMinimumWidth(0, 150)
+        gv.setColumnStretch(1, 1)
+        lbl_ver = QLabel("Версия:")
+        lbl_ver.setObjectName("frow_label")
+        gv.addWidget(lbl_ver, 0, 0)
+        self.version_label = QLabel(updater.current_version())
+        self.version_label.setStyleSheet(
+            "font-size: 13px; font-weight: 500; color: #18181B; background: transparent;"
+        )
+        gv.addWidget(self.version_label, 0, 1)
+        self.update_btn = QPushButton("Проверить обновления")
+        self.update_btn.setObjectName("btn_outline")
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.setEnabled(updater.is_available())
+        self.update_btn.clicked.connect(self._on_check_updates)
+        gv.addWidget(self.update_btn, 0, 2)
+        self.update_hint = QLabel(
+            "" if updater.is_available()
+            else "Обновления доступны только в установленной версии."
+        )
+        self.update_hint.setObjectName("frow_hint")
+        self.update_hint.setWordWrap(True)
+        gv.addWidget(self.update_hint, 1, 1)
+        body_v.addLayout(gv)
 
         # T-165: frow_mode — Режим обработки (radio + spinbox порога).
         # Слева label-150 (как остальные frow_*), справа VBox с 3 radio + строка-spinbox.
@@ -2541,6 +2645,107 @@ class SettingsDialog(QDialog):
         if chosen:
             self.path_edit.setText(chosen)
 
+    # === T-261: строка «Ускорение GPU» ===
+    def _refresh_cuda_row(self) -> None:
+        """Три состояния: слой стоит / есть карта, но слоя нет / качать нечего."""
+        gpu = cuda_layer.gpu()
+        if cuda_layer.is_installed():
+            size = cuda_layer.installed_bytes()
+            self.cuda_value_label.setText(f"включено · {engine.fmt_bytes(size)}")
+            self.cuda_hint.setText(
+                "Транскрипция идёт на видеокарте. Удаление освободит место, "
+                "приложение продолжит работать на процессоре."
+            )
+            self.cuda_btn.setText("Удалить")
+            self.cuda_btn.setEnabled(True)
+        elif cuda_layer.runtime_in_environment():
+            self.cuda_value_label.setText("включено (системная CUDA)")
+            self.cuda_hint.setText(
+                "CUDA уже есть в системе — отдельная докачка не нужна."
+            )
+            self.cuda_btn.setText("Скачать")
+            self.cuda_btn.setEnabled(False)
+        elif gpu:
+            self.cuda_value_label.setText("выключено")
+            self.cuda_hint.setText(
+                f"Найдена {gpu.get('name', 'NVIDIA')}. Докачка ~{cuda_layer.size_hint_mb()} МБ "
+                "заметно ускорит транскрипцию."
+            )
+            self.cuda_btn.setText("Скачать")
+            self.cuda_btn.setEnabled(True)
+        else:
+            self.cuda_value_label.setText("недоступно")
+            self.cuda_hint.setText(
+                "Видеокарта NVIDIA не найдена — работаем на процессоре."
+            )
+            self.cuda_btn.setText("Скачать")
+            self.cuda_btn.setEnabled(False)
+
+    # === T-262: ручная проверка обновлений ===
+    @Slot(object, str)
+    def _on_update_checked(self, info, error: str) -> None:
+        """Итог проверки в GUI-потоке: обновить, «всё свежее» или причина отказа."""
+        self.update_btn.setEnabled(updater.is_available())
+        if error:
+            self.update_hint.setText(f"Проверка не удалась: {error}")
+            return
+        if info is None:
+            self.update_hint.setText(
+                f"Установлена последняя версия ({updater.current_version()})."
+            )
+            return
+        version = updater.version_of(info)
+        self.update_hint.setText(f"Доступна версия {version}.")
+        answer = QMessageBox.question(
+            self, "Доступно обновление",
+            f"Версия {version} готова к установке.\n\n"
+            "Скачать и перезапустить приложение? Записи, настройки и скачанные "
+            "модели останутся на месте.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.update_hint.setText("Скачиваю обновление…")
+        self.update_btn.setEnabled(False)
+        # Управление из download_and_apply не возвращается: velopack
+        # перезапускает процесс сам, поэтому это последнее, что делает диалог.
+        threading.Thread(
+            target=lambda: updater.download_and_apply(info),
+            daemon=True, name="update-apply",
+        ).start()
+
+    def _on_check_updates(self) -> None:
+        self.update_btn.setEnabled(False)
+        self.update_hint.setText("Проверяю…")
+
+        def _worker() -> None:
+            try:
+                info = updater.check(quiet=False)
+                self.update_checked.emit(info, "")
+            except Exception as exc:
+                self.update_checked.emit(None, f"{exc.__class__.__name__}: {exc}")
+
+        threading.Thread(target=_worker, daemon=True, name="update-check").start()
+
+    def _on_cuda_button(self) -> None:
+        # Импорт здесь, а не наверху: transcribe_ui уже импортирует этот модуль,
+        # и встречный импорт на уровне файла замкнул бы цикл.
+        from .transcribe_ui import download_cuda_layer
+
+        if cuda_layer.is_installed():
+            ok, msg = cuda_layer.remove()
+            if ok:
+                QMessageBox.information(self, "Ускорение GPU", msg)
+            else:
+                QMessageBox.warning(self, "Ускорение GPU", msg)
+            self._refresh_cuda_row()
+            return
+        # Настройки уходят на второй план: скачивание модальное и живёт дольше
+        # диалога, поэтому родителем берём главное окно.
+        self._cuda_requested = True
+        self.accept()
+        download_cuda_layer(parent=self.parent())
+
     def _hotkey_pynput(self) -> str:
         seq = self.hotkey_edit.keySequence()
         if seq.isEmpty():
@@ -2595,6 +2800,10 @@ class SettingsDialog(QDialog):
             "dictionary": self.dict_edit.toPlainText().strip(),
             "speaker_self": self.speaker_self_edit.text().strip() or DEFAULT_SPEAKER_SELF,
             "speaker_other": self.speaker_other_edit.text().strip() or DEFAULT_SPEAKER_OTHER,
+            # T-261: нажали «Скачать» — прежний отказ снимаем, иначе следующий
+            # старт снова считал бы, что от ускорения отказались навсегда.
+            "cuda_layer_declined": False if self._cuda_requested else self._cuda_declined,
+            "check_updates": bool(self.updates_box.isChecked()),
         }
 
     def replacement_rules(self) -> "list | None":

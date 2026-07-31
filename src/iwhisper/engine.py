@@ -55,14 +55,36 @@ def log(msg: str) -> None:
 
 # === CUDA DLL (Windows) — должно выполниться ДО импорта faster_whisper ===
 def setup_cuda_dll_paths() -> list[Path]:
-    """Подключить папки `site-packages/nvidia/*/bin/` к DLL search (Windows).
+    """Подключить папки с CUDA-DLL к DLL search (Windows).
 
-    pip-пакеты nvidia-cublas-cu12 / nvidia-cudnn-cu12 кладут DLL туда, а
-    CTranslate2 грузит их классическим Windows DLL search, который не смотрит в
-    site-packages. Добавляем и через `os.add_dll_directory()`, и в PATH.
+    Два источника, в таком порядке:
+
+    1. Докачанный слой в профиле пользователя (`%LOCALAPPDATA%\\iwhisper\\cuda\\bin`)
+       — так CUDA приезжает к собранному приложению, внутри которого никакого
+       site-packages нет вообще (см. `cuda_layer.py`).
+    2. pip-пакеты nvidia-cublas-cu12 / nvidia-cudnn-cu12 в site-packages — путь
+       разработчика, у которого всё поставлено через pip.
+
+    CTranslate2 грузит эти DLL классическим Windows DLL search, который не
+    смотрит ни туда, ни туда. Добавляем и через `os.add_dll_directory()`, и в PATH.
+    Функция идемпотентна: `cuda_layer.activate()` зовёт её повторно после
+    скачивания слоя.
     """
     if sys.platform != "win32":
         return []
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    try:
+        from . import profile
+
+        layer_bin = profile.cuda_dir() / "bin"
+        if layer_bin.is_dir():
+            seen.add(str(layer_bin).lower())
+            candidates.append(layer_bin)
+    except Exception:
+        pass
+
     site_paths: list[str] = []
     try:
         site_paths.extend(site.getsitepackages())
@@ -72,8 +94,6 @@ def setup_cuda_dll_paths() -> list[Path]:
         site_paths.append(site.getusersitepackages())
     except Exception:
         pass
-    candidates: list[Path] = []
-    seen: set[str] = set()
     for sp in site_paths:
         nvidia_root = Path(sp) / "nvidia"
         if not nvidia_root.exists():
@@ -270,6 +290,36 @@ def detect_gpu() -> Optional[dict]:
         return {"name": parts[0], "vram_mb": int(float(parts[1]))}
     except ValueError:
         return None
+
+
+def cuda_runtime_available() -> bool:
+    """Есть ли на машине cuBLAS/cuDNN, которые сможет открыть CTranslate2.
+
+    Три источника: докачанный слой и pip-пакеты (их подключил
+    `setup_cuda_dll_paths`) плюс системный CUDA Toolkit в PATH. Без этой
+    проверки `device="auto"` на машине без CUDA перебирает четыре compute_type,
+    каждый раз ловит исключение из нативного кода и сыпет в лог «GPU не
+    запустился» — пугающе и незаслуженно (T-261).
+    """
+    if sys.platform != "win32":
+        return True  # на Linux/macOS решает сам CTranslate2, там DLL search другой
+    for path in CUDA_DLL_DIRS:
+        try:
+            if any(p.name.lower().startswith("cublas64") for p in Path(path).glob("*.dll")):
+                return True
+        except OSError:
+            continue
+    try:
+        import ctypes.util
+
+        return ctypes.util.find_library("cublas64_12") is not None
+    except Exception:
+        return False
+
+
+def gpu_usable() -> bool:
+    """И карта видна, и рантайм есть — только тогда есть смысл идти на CUDA."""
+    return detect_gpu() is not None and cuda_runtime_available()
 
 
 def recommended_preset() -> str:
@@ -728,6 +778,12 @@ def load_model(
         from faster_whisper import WhisperModel
 
         last_err: Optional[Exception] = None
+        if device == "auto" and not cuda_runtime_available():
+            # Машина без CUDA-рантайма (собранная версия без докачанного слоя).
+            # Молча идём на CPU: перебирать GPU-варианты тут нечего, а четыре
+            # исключения подряд в логе выглядят как поломка.
+            logger("CUDA-рантайм не найден — работаем на CPU")
+            device = "cpu"
         if device in ("auto", "cuda"):
             for ct in GPU_COMPUTE_TYPES:
                 try:

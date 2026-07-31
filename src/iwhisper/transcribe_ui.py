@@ -129,8 +129,13 @@ try:
     ))
     _splash.resizable(False, False)
     _splash.attributes("-topmost", True)
-    # Заменяем дефолтную «перо»-иконку Tk на наш waveform .ico (если уже сгенерён)
+    # Заменяем дефолтную «перо»-иконку Tk на наш waveform .ico. Сгенерированный
+    # появляется в профиле только после первого полного старта, поэтому на самом
+    # первом запуске (и в собранной версии) берём эталон из поставки.
+    from .profile import resource_dir as _resource_dir
     _ico = _P(_runtime_dir().parent) / "icons" / "iwhisper.ico"
+    if not _ico.exists():
+        _ico = _resource_dir() / "iwhisper.ico"
     if _ico.exists():
         try:
             _splash.iconbitmap(str(_ico))
@@ -167,8 +172,10 @@ from pathlib import Path
 
 # T-259: engine — единственная точка загрузки модели. Его импорт настраивает
 # CUDA DLL-пути (Windows), поэтому идёт ДО всего, что тянет ctranslate2.
+from . import cuda_layer
 from . import engine
 from . import profile
+from . import updater
 
 import numpy as np
 import sounddevice as sd
@@ -1786,6 +1793,242 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
     threading.Thread(target=_worker, daemon=True, name="model-switch").start()
 
 
+def start_startup_model() -> None:
+    """Поднять модель на старте: из кэша — молча в фоне, иначе с прогрессом.
+
+    T-132: preload нужен streaming-worker'у с первой же записи. T-259: если
+    весов ещё нет на диске — качаем видимо, а не 480 МБ в тишине под видом
+    «зависло». T-261: вызывается либо сразу, либо после докачки CUDA-слоя.
+    """
+    spec = active_model_spec()
+    if engine.is_cached(spec):
+        threading.Thread(target=load_model, daemon=True, name="model-preload").start()
+    else:
+        log(f"модель {spec} не найдена на диске — качаю с прогрессом")
+        QTimer.singleShot(0, lambda: start_model_switch(spec, dict(SETTINGS)))
+
+
+# === T-261: докачка CUDA-слоя ===
+class _CudaLayerBridge(QObject):
+    """Мост worker → GUI для скачивания CUDA-слоя (тот же приём, что у модели)."""
+
+    progress = Signal(int, int)  # done_bytes, total_bytes
+    finished = Signal(bool, str)  # ok, error ("" — успех)
+
+
+_cuda_bridge: "_CudaLayerBridge | None" = None
+_cuda_dialog = None
+_cuda_cancel = threading.Event()
+
+
+def download_cuda_layer(parent=None, then_start_model: bool = False) -> None:
+    """Скачать и установить CUDA-слой с прогрессом и отменой. GUI thread.
+
+    Отмена не выбрасывает скачанное: недокачанный файл остаётся в профиле, и
+    следующий заход продолжает с той же точки (450 МБ по плохой сети иначе
+    превращаются в бесконечный цикл «начали — оборвалось — начали заново»).
+
+    `then_start_model` — вариант со старта приложения: модель ждёт итога, чтобы
+    подняться уже на GPU (иначе ускорение включилось бы только через перезапуск).
+    """
+    global _cuda_bridge, _cuda_dialog
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtWidgets import QMessageBox, QProgressDialog
+
+    if _cuda_dialog is not None:
+        log("CUDA layer download already in progress — ignore")
+        return
+
+    parent = parent or window
+    _cuda_cancel.clear()
+    dlg = QProgressDialog(
+        f"Скачиваю ускорение GPU… ~{cuda_layer.size_hint_mb()} МБ", "Отмена", 0, 0, parent
+    )
+    dlg.setWindowTitle("iWhisper — ускорение GPU")
+    dlg.setWindowModality(_Qt.ApplicationModal)
+    dlg.setMinimumDuration(0)
+    dlg.setAutoClose(False)
+    dlg.setAutoReset(False)
+    dlg.setMinimumWidth(460)
+    dlg.canceled.connect(_cuda_cancel.set)
+
+    bridge = _CudaLayerBridge()
+
+    @Slot(int, int)
+    def _on_progress(done: int, total: int) -> None:
+        if _cuda_dialog is None:
+            return
+        if total > 0:
+            _cuda_dialog.setRange(0, 100)
+            _cuda_dialog.setValue(int(done * 100 / total))
+            _cuda_dialog.setLabelText(
+                f"Скачиваю ускорение GPU… {done / 1e6:.0f} / {total / 1e6:.0f} МБ"
+            )
+        else:
+            _cuda_dialog.setLabelText(f"Скачиваю ускорение GPU… {done / 1e6:.0f} МБ")
+
+    @Slot(bool, str)
+    def _on_finished(ok: bool, error: str) -> None:
+        global _cuda_dialog, _cuda_bridge
+        if _cuda_dialog is not None:
+            _cuda_dialog.close()
+            _cuda_dialog = None
+        _cuda_bridge = None
+        if ok:
+            log("CUDA-слой установлен")
+            QMessageBox.information(
+                parent, "Ускорение GPU установлено",
+                "Готово. Ускорение включится после перезапуска iWhisper."
+                if cuda_layer.needs_restart()
+                else "Готово — транскрипция пойдёт на видеокарте.",
+            )
+        elif _cuda_cancel.is_set():
+            log("CUDA-слой: скачивание отменено пользователем")  # молча: отмену нажали сами
+        else:
+            log(f"CUDA-слой FAIL: {error}")
+            QMessageBox.warning(
+                parent, "Ускорение GPU не установилось",
+                f"{error}\n\nПриложение продолжит работать на процессоре. "
+                "Повторить можно в настройках.",
+            )
+        # Модель ждала итога — поднимаем её в любом случае, хоть на GPU, хоть на CPU
+        if then_start_model:
+            start_startup_model()
+
+    bridge.progress.connect(_on_progress)
+    bridge.finished.connect(_on_finished)
+    _cuda_bridge = bridge
+    _cuda_dialog = dlg
+    dlg.show()
+
+    def _worker() -> None:
+        try:
+            ok = cuda_layer.ensure(
+                progress_cb=lambda d, t: bridge.progress.emit(int(d), int(t)),
+                should_cancel=_cuda_cancel.is_set,
+            )
+            bridge.finished.emit(ok, "" if ok else "Слой скачан, но библиотеки не подхватились.")
+        except cuda_layer.LayerError as exc:
+            bridge.finished.emit(False, str(exc))
+        except Exception as exc:
+            bridge.finished.emit(False, f"{exc.__class__.__name__}: {exc}")
+
+    threading.Thread(target=_worker, daemon=True, name="cuda-layer").start()
+
+
+# === T-262: фоновая проверка обновлений ===
+class _UpdateBridge(QObject):
+    """Мост из фонового потока проверки обновлений в GUI."""
+
+    found = Signal(object)  # UpdateInfo
+
+
+_update_bridge: "_UpdateBridge | None" = None
+_update_box = None
+
+
+def _show_update_offer(info) -> None:
+    """Немодальное предложение обновиться. GUI thread.
+
+    Немодальное сознательно: человек мог запустить приложение, чтобы прямо
+    сейчас надиктовать мысль, и модалка поперёк этого — худшее, что может
+    сделать апдейтер. Окно висит, работать не мешает, закрывается без ответа.
+    """
+    global _update_box
+    from PySide6.QtWidgets import QMessageBox
+
+    if _update_box is not None:
+        return
+    version = updater.version_of(info)
+    box = QMessageBox(window)
+    box.setWindowTitle("Доступно обновление")
+    box.setIcon(QMessageBox.Information)
+    box.setText(f"Вышла версия {version}.")
+    box.setInformativeText(
+        "Записи, настройки, словарь и скачанные модели останутся на месте."
+    )
+    update_btn = box.addButton("Обновить и перезапустить", QMessageBox.AcceptRole)
+    box.addButton("Позже", QMessageBox.RejectRole)
+    box.setDefaultButton(update_btn)
+
+    def _on_done(_button) -> None:
+        global _update_box
+        _update_box = None
+        if box.clickedButton() is not update_btn:
+            log("обновление отложено пользователем")
+            return
+        threading.Thread(
+            target=lambda: updater.download_and_apply(info),
+            daemon=True, name="update-apply",
+        ).start()
+
+    box.buttonClicked.connect(_on_done)
+    _update_box = box
+    box.show()
+
+
+def start_update_check() -> None:
+    """Спросить про обновления в фоне, если это разрешено настройками."""
+    global _update_bridge
+
+    if not SETTINGS.get("check_updates", True):
+        log("автопроверка обновлений выключена в настройках")
+        return
+    if not updater.is_available():
+        return  # не установленная версия или фид не настроен — молча
+
+    bridge = _UpdateBridge()
+    bridge.found.connect(_show_update_offer)
+    _update_bridge = bridge
+
+    def _worker() -> None:
+        info = updater.check()  # тихая: сетевые ошибки только в лог
+        if info is not None:
+            bridge.found.emit(info)
+
+    threading.Thread(target=_worker, daemon=True, name="update-check").start()
+
+
+def maybe_offer_cuda_layer() -> None:
+    """Найдена NVIDIA, а CUDA-рантайма нет — предложить докачать. GUI thread.
+
+    Зовётся ДО загрузки модели: после первого импорта CTranslate2 подключить
+    новые DLL уже нельзя, понадобился бы перезапуск.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    if SETTINGS.get("cuda_layer_declined", False):
+        return
+    try:
+        if not cuda_layer.should_offer():
+            return
+        gpu = cuda_layer.gpu() or {}
+    except Exception as exc:
+        log(f"cuda layer probe fail: {exc!r}")
+        return
+
+    name = gpu.get("name") or "видеокарта NVIDIA"
+    answer = QMessageBox.question(
+        window,
+        "Найдена видеокарта NVIDIA",
+        f"Обнаружена {name}.\n\n"
+        f"Скачать ускорение? ~{cuda_layer.size_hint_mb()} МБ, транскрипция станет "
+        "заметно быстрее.\n\nБез него всё работает на процессоре — просто медленнее. "
+        "Передумать можно в настройках.",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+    if answer == QMessageBox.Yes:
+        download_cuda_layer(then_start_model=True)
+        return
+    SETTINGS["cuda_layer_declined"] = True
+    try:
+        save_settings_dict(SETTINGS)
+    except Exception as exc:
+        log(f"cuda decline save fail: {exc}")
+    log("CUDA-слой: пользователь отказался — работаем на CPU")
+
+
 class _Bridge(QObject):
     """Мост между сигналами MainWindow и hotkey-логикой (Qt main thread)."""
 
@@ -2058,12 +2301,14 @@ def main() -> None:
     # ускоряет. Lock внутри engine.load_model() защищает от race c lazy-loader'ом.
     # T-259: если модели ещё нет на диске — качаем с прогрессом (модалка), а не
     # молча 480 МБ / 1.6 ГБ в тишине под видом «зависло».
-    _startup_spec = active_model_spec()
-    if engine.is_cached(_startup_spec):
-        threading.Thread(target=load_model, daemon=True, name="model-preload").start()
+    # T-261: сначала CUDA-слой, потом модель. Обратный порядок означал бы, что
+    # CTranslate2 уже загрузился без CUDA, и скачанные DLL подхватились бы
+    # только со следующего запуска.
+    maybe_offer_cuda_layer()
+    if _cuda_dialog is None:
+        start_startup_model()
     else:
-        log(f"модель {_startup_spec} не найдена на диске — качаю с прогрессом")
-        QTimer.singleShot(0, lambda: start_model_switch(_startup_spec, dict(SETTINGS)))
+        log("загрузка модели отложена: идёт докачка CUDA-слоя")
 
     # T-164: pre-roll singleton + старт если включён в Settings (дефолт OFF).
     # Hot-reload в Settings dialog → _Bridge.on_settings_changed start/stop.
@@ -2105,6 +2350,10 @@ def main() -> None:
 
     if not SETTINGS.get("start_minimized", False):
         window.show_window()  # showNormal + raise_ + activateWindow
+
+    # T-262: обновления спрашиваем последними и в фоне — до них уже поднялись
+    # модель и хоткеи, так что задержка сети ничего не задерживает.
+    start_update_check()
 
     # T-176: проверка прерванных созвонов (recovery) — в фоне, не морозит старт.
     # Сборка WAV в worker'е, предложение транскрипта — через сигнал в GUI-поток.
