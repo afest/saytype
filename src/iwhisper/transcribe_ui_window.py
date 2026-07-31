@@ -97,6 +97,9 @@ DEFAULT_AUTO_THRESHOLD_SEC = 10
 DEFAULT_PRE_ROLL_ENABLED = False  # T-164: rolling 500мс ДО hotkey (always-on mic, дефолт OFF)
 DEFAULT_KEEP_CALL_AUDIO = False   # T-174: хранить MP3 созвона (дефолт OFF — нужен только транскрипт)
 DEFAULT_CHECK_UPDATES = True      # T-262: фоновая проверка обновлений (выключаемая в настройках)
+# T-263: устройство записи. Пусто = системное по умолчанию — так было всегда и
+# так остаётся, пока человек не выберет конкретный микрофон в мастере.
+DEFAULT_MIC_DEVICE = ""
 DEFAULT_CALL_AUDIO_KEEP = 2       # T-175: сколько последних WAV созвонов держать в Calls\ (буфер «вернуться»)
 # T-259: модель транскрипции. `model` = ключ пресета из engine.PRESETS либо
 # "custom"; при "custom" значение берётся из `custom_model` (HF repo id или путь
@@ -417,6 +420,19 @@ def load_settings_dict() -> dict:
         model_key = engine.recommended_preset()
         s.setValue("model", model_key)
         s.sync()
+    # T-263: мастер первого запуска — по тому же правилу, что и модель выше.
+    # У того, кто пользовался приложением до появления мастера, настройки уже
+    # выставлены, и показывать ему шаги «выберите микрофон, выберите хоткей»
+    # после обновления — навязываться с тем, что он давно решил.
+    if s.contains("wizard_done"):
+        wizard_done = _as_bool(s.value("wizard_done", False))
+    elif SETTINGS_FILE.exists() and s.contains("hotkey"):
+        wizard_done = True
+        s.setValue("wizard_done", True)
+        s.sync()
+    else:
+        wizard_done = False
+
     custom_model = s.value("custom_model", "", type=str) or ""
     if model_key not in engine.PRESET_KEYS and model_key != engine.CUSTOM_KEY:
         model_key = DEFAULT_MODEL_EXISTING  # повреждённое значение → дефолт
@@ -444,6 +460,14 @@ def load_settings_dict() -> dict:
         "cuda_layer_declined": _as_bool(s.value("cuda_layer_declined", False)),
         # T-262: фоновая проверка обновлений при старте
         "check_updates": _as_bool(s.value("check_updates", DEFAULT_CHECK_UPDATES)),
+        # T-263: имя устройства записи (пусто — системное) и признак того, что
+        # мастер первого запуска уже пройден
+        "mic_device": s.value("mic_device", DEFAULT_MIC_DEVICE, type=str) or "",
+        "wizard_done": wizard_done,
+        # Язык интерфейса запоминается уже сейчас, хотя переключать пока нечего:
+        # перевод вынесен в отдельную задачу, а определить язык по локали при
+        # первом запуске надо в момент первого запуска, а не задним числом.
+        "ui_language": s.value("ui_language", "", type=str) or "",
         # Словарь — отдельный файл в профиле, а не значение ini: пользователь
         # правит его руками и делится им, а QSettings экранирует не-ASCII.
         "dictionary": profile.load_dictionary(),
@@ -483,6 +507,12 @@ def save_settings_dict(d: dict) -> None:
     if "cuda_layer_declined" in d:
         s.setValue("cuda_layer_declined", bool(d["cuda_layer_declined"]))
     s.setValue("check_updates", bool(d.get("check_updates", DEFAULT_CHECK_UPDATES)))
+    if "mic_device" in d:
+        s.setValue("mic_device", (d.get("mic_device") or "").strip())
+    if "wizard_done" in d:
+        s.setValue("wizard_done", bool(d["wizard_done"]))
+    if d.get("ui_language"):
+        s.setValue("ui_language", d["ui_language"])
     s.sync()
     if "dictionary" in d:
         profile.save_dictionary(d.get("dictionary") or "")
@@ -2521,6 +2551,30 @@ class SettingsDialog(QDialog):
         gv.addWidget(self.update_hint, 1, 1)
         body_v.addLayout(gv)
 
+        # frow_wizard: повторный проход мастера первого запуска (T-263)
+        gw = _QGrid()
+        gw.setContentsMargins(0, 8, 0, 0)
+        gw.setHorizontalSpacing(8)
+        gw.setVerticalSpacing(4)
+        gw.setColumnMinimumWidth(0, 150)
+        gw.setColumnStretch(1, 1)
+        lbl_wiz = QLabel("Первый запуск:")
+        lbl_wiz.setObjectName("frow_label")
+        gw.addWidget(lbl_wiz, 0, 0)
+        wiz_hint = QLabel(
+            "Микрофон, горячая клавиша, модель и ускорение — по шагам, "
+            "как при первом запуске."
+        )
+        wiz_hint.setObjectName("frow_hint")
+        wiz_hint.setWordWrap(True)
+        gw.addWidget(wiz_hint, 0, 1)
+        self.wizard_btn = QPushButton("Пройти заново")
+        self.wizard_btn.setObjectName("btn_outline")
+        self.wizard_btn.setCursor(Qt.PointingHandCursor)
+        self.wizard_btn.clicked.connect(self._on_run_wizard)
+        gw.addWidget(self.wizard_btn, 0, 2)
+        body_v.addLayout(gw)
+
         # T-165: frow_mode — Режим обработки (radio + spinbox порога).
         # Слева label-150 (как остальные frow_*), справа VBox с 3 radio + строка-spinbox.
         gm = _QGrid()
@@ -2713,6 +2767,14 @@ class SettingsDialog(QDialog):
             target=lambda: updater.download_and_apply(info),
             daemon=True, name="update-apply",
         ).start()
+
+    def _on_run_wizard(self) -> None:
+        """Пройти мастер заново. Настройки закрываем: мастер пишет те же ключи,
+        и оставленный позади диалог перетёр бы его выбор своим старым состоянием."""
+        from .transcribe_ui import run_first_run_wizard
+
+        self.accept()
+        run_first_run_wizard(force=True)
 
     def _on_check_updates(self) -> None:
         self.update_btn.setEnabled(False)

@@ -556,6 +556,7 @@ class PreRollBuffer:
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="float32",
+                device=mic_device(),  # T-263: выбранный микрофон или системный
                 callback=self._callback,
             )
             stream.start()
@@ -587,6 +588,29 @@ class PreRollBuffer:
             if not self._deque:
                 return np.zeros(0, dtype=np.float32)
             return np.fromiter(self._deque, dtype=np.float32, count=len(self._deque))
+
+
+def mic_device() -> "int | None":
+    """Устройство записи для sounddevice: индекс выбранного или None (системное).
+
+    В настройках хранится **имя**, а не индекс: индексы sounddevice меняются от
+    подключения наушников и перезапуска службы звука, и вчерашняя «двойка»
+    сегодня оказывается другим микрофоном. Имя не нашлось (устройство отключили)
+    — молча возвращаемся к системному: остаться без записи хуже, чем записать
+    не тем микрофоном, а строчка в логе объяснит, что произошло.
+    """
+    name = (SETTINGS.get("mic_device") or "").strip()
+    if not name:
+        return None
+    try:
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels", 0)) > 0 and dev.get("name") == name:
+                return idx
+    except Exception as exc:
+        log(f"не смог перечислить устройства записи ({exc!r}) — беру системное")
+        return None
+    log(f"микрофон «{name}» не найден — беру системный")
+    return None
 
 
 def log(msg: str) -> None:
@@ -974,7 +998,9 @@ def start_recording() -> None:
                     pass  # эквалайзер не должен ронять запись
 
     audio_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", callback=cb
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32",
+        device=mic_device(),  # T-263: выбранный микрофон или системный
+        callback=cb,
     )
     audio_stream.start()
     set_state("recording")  # overlay покажет «● Запись» + эквалайзер
@@ -1793,6 +1819,43 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
     threading.Thread(target=_worker, daemon=True, name="model-switch").start()
 
 
+def run_first_run_wizard(force: bool = False) -> bool:
+    """Мастер первого запуска. Возвращает True, если человек его прошёл.
+
+    Зовётся до загрузки модели и до предложения CUDA-слоя: в мастере оба выбора
+    уже сделаны, и повторно спрашивать про то же самое было бы издевательством.
+    `force=True` — повторный запуск из настроек.
+    """
+    global SETTINGS
+
+    if not force and SETTINGS.get("wizard_done", False):
+        return False
+    from .wizard import FirstRunWizard
+
+    dialog = FirstRunWizard(dict(SETTINGS), window)
+    if dialog.exec() != dialog.Accepted:
+        # Закрыли крестиком — не считаем пройденным, спросим в следующий раз.
+        log("мастер первого запуска закрыт без завершения")
+        return False
+
+    values = dialog.values()
+    SETTINGS.update(values)
+    try:
+        save_settings_dict(SETTINGS)
+    except Exception as exc:
+        log(f"мастер: не смог сохранить настройки ({exc})")
+    log(
+        "мастер пройден: mic=%s hotkey=%s model=%s autostart=%s"
+        % (values["mic_device"] or "системный", values["hotkey"],
+           values["model"], values["autostart"])
+    )
+    reload_hotkey(values["hotkey"])
+    _sync_autostart_on_start()
+    if dialog.wants_cuda_layer():
+        download_cuda_layer(then_start_model=True)
+    return True
+
+
 def start_startup_model() -> None:
     """Поднять модель на старте: из кэша — молча в фоне, иначе с прогрессом.
 
@@ -2301,10 +2364,16 @@ def main() -> None:
     # ускоряет. Lock внутри engine.load_model() защищает от race c lazy-loader'ом.
     # T-259: если модели ещё нет на диске — качаем с прогрессом (модалка), а не
     # молча 480 МБ / 1.6 ГБ в тишине под видом «зависло».
+    # T-263: первый запуск — мастер. Он сам спрашивает и про модель, и про
+    # ускорение, поэтому обычные предложения ниже при пройденном мастере
+    # оказываются пустыми: выбор уже сделан и сохранён.
+    wizard_passed = run_first_run_wizard()
+
     # T-261: сначала CUDA-слой, потом модель. Обратный порядок означал бы, что
     # CTranslate2 уже загрузился без CUDA, и скачанные DLL подхватились бы
     # только со следующего запуска.
-    maybe_offer_cuda_layer()
+    if not wizard_passed:
+        maybe_offer_cuda_layer()
     if _cuda_dialog is None:
         start_startup_model()
     else:
