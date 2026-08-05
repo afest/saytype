@@ -1,8 +1,8 @@
 """profile.py — где приложение хранит данные пользователя.
 
 Один модуль отвечает на вопрос «куда писать», чтобы в остальном коде не было ни
-одного пути с буквой диска. Всё лежит под ``%LOCALAPPDATA%\\iwhisper`` (Windows)
-или ``~/.local/share/iwhisper`` (остальные платформы):
+одного пути с буквой диска. Всё лежит под ``%LOCALAPPDATA%\\saytype`` (Windows)
+или ``~/.local/share/saytype`` (остальные платформы):
 
     settings.ini        настройки приложения (QSettings IniFormat)
     dictionary.txt      словарь: слова, имена и термины, которые модель путает
@@ -27,7 +27,12 @@ import shutil
 import sys
 from pathlib import Path
 
-APP_DIR_NAME = "iwhisper"
+APP_DIR_NAME = "saytype"
+
+# Как папка называлась до переименования продукта (T-318). Переезд делается
+# один раз и переименованием папки целиком: скачанные веса и CUDA-слой весят
+# гигабайты, а переименование в пределах тома — мгновенная операция.
+LEGACY_APP_DIR_NAME = "iwhisper"
 
 # Бюджет `initial_prompt` у Whisper — max_length // 2 - 1 токенов. Лишнее
 # отрезается МОЛЧА и С НАЧАЛА строки: первые слова словаря просто перестают
@@ -41,13 +46,45 @@ CALLS_SUBDIR = "Calls"
 _REPLACEMENTS_VERSION = 1
 
 
-def profile_dir() -> Path:
-    """Корень пользовательских данных. Создаётся при первом обращении."""
+def _profile_base() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    path = Path(base) / APP_DIR_NAME
+    return Path(base)
+
+
+def resolve_profile_dir() -> Path:
+    """Где лежат данные — с учётом переезда со старого имени папки.
+
+    Переезжаем один раз: если папки под новым именем ещё нет, а старая есть —
+    переименовываем её. Не получилось (файл занят, права, антивирус) —
+    **остаёмся на старой** и пробуем в следующий раз. Создать вместо неё пустую
+    новую значило бы, что словарь, замены и гигабайты скачанных весов молча
+    исчезли, хотя лежат рядом.
+
+    Только `rename`, никакого `shutil.move` в запасе. Move при занятом файле
+    внутри деградирует в «скопировать целиком и удалить оригинал», и на профиле
+    с весами моделей это молча съедает лишние гигабайты, а оригинал остаётся:
+    старая копия и новая начинают расходиться. Переименование либо срабатывает
+    целиком, либо не делает ничего — здесь нужно ровно это.
+    """
+    base = _profile_base()
+    target = base / APP_DIR_NAME
+    if target.exists():
+        return target
+    legacy = base / LEGACY_APP_DIR_NAME
+    if legacy.is_dir():
+        try:
+            legacy.rename(target)
+        except OSError:
+            return legacy
+    return target
+
+
+def profile_dir() -> Path:
+    """Корень пользовательских данных. Создаётся при первом обращении."""
+    path = resolve_profile_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -87,6 +124,20 @@ def resource_dir() -> Path:
     if bundled:
         return Path(bundled) / "assets"
     return Path(__file__).resolve().parents[2] / "assets"
+
+
+def licenses_dir() -> Path:
+    """Тексты лицензий, которые едут вместе с поставкой (T-318).
+
+    Кладутся в сборку через `datas` в спеке, поэтому в замороженном виде лежат
+    рядом с остальными ресурсами, а при запуске из исходников — в папке
+    ``licenses/`` репозитория. Путь может не существовать (установка пакета
+    через pip их не копирует) — вызывающий проверяет сам.
+    """
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        return Path(bundled) / "licenses"
+    return Path(__file__).resolve().parents[2] / "licenses"
 
 
 def cuda_dir() -> Path:

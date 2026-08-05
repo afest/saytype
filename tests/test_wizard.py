@@ -18,10 +18,10 @@ def fresh_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
     import importlib
 
-    from iwhisper import profile
+    from saytype import profile
 
     importlib.reload(profile)
-    window = importlib.import_module("iwhisper.transcribe_ui_window")
+    window = importlib.import_module("saytype.transcribe_ui_window")
     importlib.reload(window)
     return window
 
@@ -72,7 +72,7 @@ def test_mic_device_defaults_to_system(fresh_profile):
 
 def test_input_devices_are_deduplicated():
     """Список для человека: микрофоны, а не хост-API одного устройства."""
-    from iwhisper import wizard
+    from saytype import wizard
 
     devices = wizard.input_devices()
     names = [d["name"] for d in devices]
@@ -81,6 +81,6 @@ def test_input_devices_are_deduplicated():
 
 
 def test_system_language_is_supported_code():
-    from iwhisper import wizard
+    from saytype import wizard
 
     assert wizard.system_language() in ("ru", "en")

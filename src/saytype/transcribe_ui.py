@@ -5,7 +5,7 @@
   истории, глобальный hotkey, точка входа QApplication.
 - `transcribe_ui_window.py` — UI слой: QMainWindow + плеер + settings + tray.
 
-Запуск: `pythonw.exe -m iwhisper` (без консольного окна).
+Запуск: `pythonw.exe -m saytype` (без консольного окна).
 """
 
 # === STDERR/STDOUT в UTF-8 + Crash logger ===
@@ -97,9 +97,9 @@ if sys.platform == "win32":
         try:
             ctypes.windll.user32.MessageBoxTimeoutW(
                 0,
-                "iWhisper уже запущен.\n\nОткрой окно через значок в трее "
+                "SayType уже запущен.\n\nОткрой окно через значок в трее "
                 "(правый нижний угол, стрелка вверх, правый клик, «Открыть окно»).",
-                "iWhisper",
+                "SayType",
                 0x40,  # MB_ICONINFORMATION
                 0,
                 5000,
@@ -122,7 +122,7 @@ try:
     import tkinter as _tk
     from pathlib import Path as _P
     _splash = _tk.Tk()
-    _splash.title("iWhisper")
+    _splash.title("SayType")
     _splash.geometry("420x140+%d+%d" % (
         (_splash.winfo_screenwidth() // 2) - 210,
         (_splash.winfo_screenheight() // 2) - 70,
@@ -133,9 +133,9 @@ try:
     # появляется в профиле только после первого полного старта, поэтому на самом
     # первом запуске (и в собранной версии) берём эталон из поставки.
     from .profile import resource_dir as _resource_dir
-    _ico = _P(_runtime_dir().parent) / "icons" / "iwhisper.ico"
+    _ico = _P(_runtime_dir().parent) / "icons" / "saytype.ico"
     if not _ico.exists():
-        _ico = _resource_dir() / "iwhisper.ico"
+        _ico = _resource_dir() / "saytype.ico"
     if _ico.exists():
         try:
             _splash.iconbitmap(str(_ico))
@@ -143,7 +143,7 @@ try:
             pass
     _tk.Label(
         _splash,
-        text="iWhisper",
+        text="SayType",
         font=("Segoe UI", 14, "bold"),
         pady=18,
     ).pack()
@@ -191,6 +191,13 @@ from .transcribe_ui_window import (
     autostart_shortcut_exists,
     load_settings_dict,
     save_settings_dict,
+)
+from . import transcribe_ui_window as call_settings  # согласие на запись созвона
+from .hotkeys import (
+    MOD_CTRL,
+    MOD_NOREPEAT,
+    MOD_SHIFT,
+    to_mod_vk as hotkey_to_mod_vk,
 )
 from .transcribe_streaming import StreamingProcessor
 from . import transcribe_call
@@ -274,64 +281,11 @@ def _native_paste() -> None:
     _user32.keybd_event(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, None)
 
 # === Win32 RegisterHotKey: модификаторы и WM_HOTKEY ===
+# Таблицы разбора hotkey-строки и константы MOD_* переехали в `hotkeys` (T-318):
+# одно место правды для настроек, мастера первого запуска и регистрации.
 WM_HOTKEY = 0x0312
-MOD_ALT = 0x0001
-MOD_CTRL = 0x0002
-MOD_SHIFT = 0x0004
-MOD_WIN = 0x0008
-MOD_NOREPEAT = 0x4000
 HOTKEY_ID = 0xC001  # произвольный id регистрации (≥ 0xC000 рекомендуется для приложений)
 HOTKEY_ID_CALL = 0xC002  # T-172: второй hotkey — запись созвона (ctrl+shift+E, захардкожен)
-
-
-PYNPUT_MOD_MAP = {
-    "<ctrl>": MOD_CTRL,
-    "<shift>": MOD_SHIFT,
-    "<alt>": MOD_ALT,
-    "<cmd>": MOD_WIN,
-    "<win>": MOD_WIN,
-    "<meta>": MOD_WIN,
-}
-
-# Специальные клавиши, которые Qt KeySequence парсит как имена (а не одиночные символы).
-# Конверсия hotkey-строки (например '<ctrl>+<shift>+f5' или '<ctrl>+<shift>+space')
-# в Windows virtual-key code, который RegisterHotKey требует на втором аргументе.
-SPECIAL_KEY_VK = {
-    "space": 0x20, "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B,
-    "escape": 0x1B, "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
-    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
-    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74, "f6": 0x75,
-    "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
-}
-
-
-def hotkey_to_mod_vk(hotkey: str) -> tuple[int, int]:
-    """Конверсия pynput-формата '<ctrl>+<shift>+q' → (modifiers, virtual_key).
-
-    Возвращает (0, 0) если не получилось распарсить.
-    """
-    if not hotkey:
-        return 0, 0
-    parts = [p.strip().lower() for p in hotkey.split("+") if p.strip()]
-    mods = 0
-    vk = 0
-    for p in parts:
-        if p in PYNPUT_MOD_MAP:
-            mods |= PYNPUT_MOD_MAP[p]
-        elif p.startswith("<") and p.endswith(">"):
-            inner = p[1:-1]
-            if inner in PYNPUT_MOD_MAP:
-                mods |= PYNPUT_MOD_MAP[f"<{inner}>"]
-            elif inner in SPECIAL_KEY_VK:
-                vk = SPECIAL_KEY_VK[inner]
-            elif len(inner) == 1 and inner.isalnum():
-                vk = ord(inner.upper())
-        elif p in SPECIAL_KEY_VK:
-            vk = SPECIAL_KEY_VK[p]
-        elif len(p) == 1 and p.isalnum():
-            vk = ord(p.upper())  # A=0x41 ... Z=0x5A, 0=0x30 ... 9=0x39
-    return mods, vk
 
 
 class _HotkeyEventFilter(QAbstractNativeEventFilter):
@@ -669,7 +623,7 @@ def ensure_icons() -> dict:
         "recording": ICON_DIR / "recording.png",
         "processing": ICON_DIR / "processing.png",
         "app": ICON_DIR / "app.png",
-        "app_ico": ICON_DIR / "iwhisper.ico",  # для ярлыка на рабочем столе
+        "app_ico": ICON_DIR / "saytype.ico",  # для ярлыка на рабочем столе
     }
     colors = {
         "idle": (140, 140, 140, 255),
@@ -705,14 +659,14 @@ def _set_taskbar_app_id() -> None:
     """AppUserModelID — Windows связывает иконку с этим ID, чтобы в taskbar
     показывался наш waveform, а не дефолтная иконка pythonw.exe."""
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("iwhisper.app.1")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("saytype.app.1")
     except Exception:
         pass
 
 
 def _sync_desktop_shortcut(ico_path: Path) -> None:
     """Обновить ярлык на рабочем столе:
-    - Переименовать `faster-whisper UI.lnk` → `iWhisper.lnk` (если ещё старое имя)
+    - Переименовать `faster-whisper UI.lnk` → `SayType.lnk` (если ещё старое имя)
     - Установить IconLocation на наш waveform .ico
     - Уведомить Windows об изменении (SHChangeNotify) — иначе Explorer кеширует
     """
@@ -720,7 +674,7 @@ def _sync_desktop_shortcut(ico_path: Path) -> None:
         return
     desktop = Path.home() / "Desktop"
     old_lnk = desktop / "faster-whisper UI.lnk"
-    new_lnk = desktop / "iWhisper.lnk"
+    new_lnk = desktop / "SayType.lnk"
     target_lnk = new_lnk if new_lnk.exists() else (old_lnk if old_lnk.exists() else None)
     if target_lnk is None:
         return  # ярлыка нет — не создаём сами (это работа T-123)
@@ -1220,8 +1174,13 @@ def stop_recording_and_transcribe() -> None:
                 f"streaming fallback to full-pass "
                 f"(chunks={streaming_result[2]}, confirmed empty — короткая запись или silence)"
             )
+        # Массив, а не путь к файлу. Путь заставляет faster-whisper декодировать
+        # wav через PyAV, а тот тянет за собой libx264/libx265 — кодеки под
+        # GPLv2+, которые в поставке распространили бы GPL на всё приложение.
+        # Данные те же: `audio_np` — исходный float32 16 kHz mono, из которого
+        # только что записан этот самый wav. Остальные три вызова так и работали.
         segments, info = m.transcribe(
-            str(wav_path),
+            audio_np,
             beam_size=BEAM_SIZE,
             vad_filter=VAD_FILTER,
             initial_prompt=INITIAL_PROMPT or None,
@@ -1571,6 +1530,41 @@ def _call_finalize_thread(recording_obj) -> None:
                 pass
 
 
+def _confirm_call_consent() -> bool:
+    """Показать предупреждение о согласии перед самой первой записью.
+
+    True — можно писать (уже подтверждали раньше либо подтвердили сейчас).
+    Вызывается из GUI-потока: и hotkey (через native event filter), и кнопка в
+    окне приходят сюда в главном потоке.
+    """
+    if call_settings.call_consent_acknowledged():
+        return True
+    if window is None:
+        # Окна нет — молча не блокируем запись, но и согласия не записываем:
+        # спросим при следующем запуске, когда интерфейс будет.
+        return True
+    from PySide6.QtWidgets import QMessageBox
+
+    box = QMessageBox(window)
+    box.setIcon(QMessageBox.Information)
+    box.setWindowTitle("Запись разговора")
+    box.setText("Предупредите собеседника о записи.")
+    box.setInformativeText(
+        "В части стран и штатов запись разговора без предупреждения второй "
+        "стороны незаконна. Приложение не знает, где вы находитесь, и не может "
+        "решить это за вас.\n\n"
+        "Показывается один раз."
+    )
+    box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+    box.button(QMessageBox.Ok).setText("Понятно, записывать")
+    box.button(QMessageBox.Cancel).setText("Отмена")
+    box.setDefaultButton(QMessageBox.Ok)
+    if box.exec() != QMessageBox.Ok:
+        return False
+    call_settings.set_call_consent_acknowledged(True)
+    return True
+
+
 def toggle_call_recording() -> None:
     """Старт/стоп записи созвона (hotkey ctrl+shift+E или UI-кнопка)."""
     global call_recorder, call_active, call_busy, call_dictation_start_idx
@@ -1578,6 +1572,14 @@ def toggle_call_recording() -> None:
         log("call toggle ignored: финализация предыдущего созвона ещё идёт")
         return
     if not call_active:
+        # T-314: один раз перед первой записью показываем то же предупреждение,
+        # что и в README. Запись разговора без предупреждения собеседника в
+        # части стран и штатов незаконна, а приложение не знает, где находится
+        # пользователь. Спрашиваем один раз, а не каждый раз: вопрос на каждом
+        # созвоне перестают читать со второго.
+        if not _confirm_call_consent():
+            log("call recording: отменено на предупреждении о согласии")
+            return
         try:
             call_recorder = CallRecorder(on_silence_alert=_call_silence_alert)
             call_recorder.start()
@@ -1751,7 +1753,7 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
     label = engine.spec_display(spec)
     head = f"Скачиваю модель {label}…" if need_download else f"Загружаю модель {label}…"
     dlg = QProgressDialog(head, None, 0, 0, window)
-    dlg.setWindowTitle("iWhisper — модель")
+    dlg.setWindowTitle("SayType — модель")
     dlg.setWindowModality(_Qt.ApplicationModal)
     dlg.setCancelButton(None)
     dlg.setMinimumDuration(0)
@@ -1907,7 +1909,7 @@ def download_cuda_layer(parent=None, then_start_model: bool = False) -> None:
     dlg = QProgressDialog(
         f"Скачиваю ускорение GPU… ~{cuda_layer.size_hint_mb()} МБ", "Отмена", 0, 0, parent
     )
-    dlg.setWindowTitle("iWhisper — ускорение GPU")
+    dlg.setWindowTitle("SayType — ускорение GPU")
     dlg.setWindowModality(_Qt.ApplicationModal)
     dlg.setMinimumDuration(0)
     dlg.setAutoClose(False)
@@ -1941,7 +1943,7 @@ def download_cuda_layer(parent=None, then_start_model: bool = False) -> None:
             log("CUDA-слой установлен")
             QMessageBox.information(
                 parent, "Ускорение GPU установлено",
-                "Готово. Ускорение включится после перезапуска iWhisper."
+                "Готово. Ускорение включится после перезапуска SayType."
                 if cuda_layer.needs_restart()
                 else "Готово — транскрипция пойдёт на видеокарте.",
             )
@@ -2230,7 +2232,7 @@ class _RecoveryBridge(QObject):
             )
             btn = QMessageBox.question(
                 window,
-                "iWhisper — восстановление созвона",
+                "SayType — восстановление созвона",
                 text,
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
@@ -2313,8 +2315,8 @@ def main() -> None:
     _sync_desktop_shortcut(icon_paths["app_ico"])
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("iWhisper")
-    app.setApplicationDisplayName("iWhisper")
+    app.setApplicationName("SayType")
+    app.setApplicationDisplayName("SayType")
     app.setQuitOnLastWindowClosed(False)  # tray держит процесс живым после close окна
 
     SETTINGS = load_settings_dict()
@@ -2448,7 +2450,7 @@ def main() -> None:
 
 
 def run() -> None:
-    """Точка входа пакета — то, что зовёт ``python -m iwhisper``.
+    """Точка входа пакета — то, что зовёт ``python -m saytype``.
 
     Сам выход из процесса делает `main()` через `engine.hard_exit` (T-268), сюда
     управление не возвращается.

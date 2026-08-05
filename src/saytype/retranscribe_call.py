@@ -9,8 +9,8 @@
 здесь нельзя, он поднял бы single-instance mutex работающего приложения.
 
 Запуск:
-    python -m iwhisper.retranscribe_call                  # последний WAV в Calls
-    python -m iwhisper.retranscribe_call "<путь к .wav>"  # конкретный файл
+    python -m saytype.retranscribe_call                  # последний WAV в Calls
+    python -m saytype.retranscribe_call "<путь к .wav>"  # конкретный файл
 """
 
 from __future__ import annotations

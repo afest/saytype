@@ -1,4 +1,4 @@
-"""WASAPI loopback capture module for iwhisper call-recording skeleton.
+"""WASAPI loopback capture module for saytype call-recording skeleton.
 
 Pinned: PyAudioWPatch 0.2.12.8 (MIT, fork of pyaudio with WASAPI loopback patch).
 Pattern adapted from s0d3s/PyAudioWPatch/examples/pawp_record_wasapi_loopback.py.

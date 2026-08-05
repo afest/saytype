@@ -26,7 +26,7 @@ param(
     # Публиковать в GitHub Releases (нужен gh/токен и заведённый remote)
     [switch]$Github,
 
-    [string]$RepoUrl = "https://github.com/afest/iwhisper",
+    [string]$RepoUrl = "https://github.com/afest/saytype",
 
     # Пропустить сборку PyInstaller, если dist уже актуален
     [switch]$SkipBuild
@@ -35,7 +35,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$python = if ($env:IWHISPER_PYTHON) { $env:IWHISPER_PYTHON } else { "python" }
+$python = if ($env:SAYTYPE_PYTHON) { $env:SAYTYPE_PYTHON } else { "python" }
 $vpk = Join-Path $env:USERPROFILE ".dotnet\tools\vpk.exe"
 if (-not (Test-Path $vpk)) {
     throw "vpk не найден ($vpk). Поставьте: dotnet tool install -g vpk"
@@ -45,7 +45,7 @@ if (-not (Test-Path $vpk)) {
 # `__version__` в пакете — то, что приложение покажет в настройках; --packVersion —
 # то, по чему апдейтер сравнивает релизы. Разъедутся — пользователь увидит одно,
 # а обновляться будет по другому.
-$initPath = "src\iwhisper\__init__.py"
+$initPath = "src\saytype\__init__.py"
 $init = Get-Content $initPath -Raw -Encoding utf8
 $patched = [regex]::Replace($init, '__version__ = "[^"]*"', "__version__ = `"$Version`"")
 if ($patched -ne $init) {
@@ -54,48 +54,68 @@ if ($patched -ne $init) {
 }
 
 # --- Сборка ---
+# Два прохода, и это не перестраховка. Список сторонних лицензий считается по
+# фактическому составу сборки (TOC PyInstaller), а сам список кладётся внутрь
+# сборки. Значит, первый проход даёт состав, потом список пересчитывается, и
+# если он изменился — нужен второй проход, иначе в поставке едет вчерашний
+# список. Проверять надо архив, а не список зависимостей.
 if (-not $SkipBuild) {
-    Write-Output "== PyInstaller =="
-    & $python -m PyInstaller --noconfirm iwhisper.spec
+    Write-Output "== PyInstaller (проход 1) =="
+    & $python -m PyInstaller --noconfirm saytype.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller упал (код $LASTEXITCODE)" }
+
+    $licenseFile = "licenses\THIRD-PARTY-LICENSES.txt"
+    $before = if (Test-Path $licenseFile) { (Get-FileHash $licenseFile).Hash } else { "" }
+    Write-Output "== список сторонних лицензий по составу сборки =="
+    & $python tools\collect_licenses.py
+    if ($LASTEXITCODE -ne 0) { throw "collect_licenses упал (код $LASTEXITCODE)" }
+    $after = (Get-FileHash $licenseFile).Hash
+
+    if ($before -ne $after) {
+        Write-Output "== список изменился → PyInstaller (проход 2) =="
+        & $python -m PyInstaller --noconfirm saytype.spec
+        if ($LASTEXITCODE -ne 0) { throw "PyInstaller упал (код $LASTEXITCODE)" }
+    } else {
+        Write-Output "   список не изменился, второй проход не нужен"
+    }
 }
-if (-not (Test-Path "dist\iwhisper\iwhisper.exe")) {
-    throw "Нет dist\iwhisper\iwhisper.exe — сборка не состоялась"
+if (-not (Test-Path "dist\saytype\saytype.exe")) {
+    throw "Нет dist\saytype\saytype.exe — сборка не состоялась"
 }
 
 # --- Пакет Velopack ---
 # Setup.exe ставит приложение в %LocalAppData%\<packId> и не спрашивает прав
 # администратора.
 #
-# packId = `iwhisper-app`, а не `iwhisper`, хотя напрашивается второе. Velopack
-# жёстко ставит приложение в папку по имени packId, а `%LocalAppData%\iwhisper`
+# packId = `saytype-app`, а не `saytype`, хотя напрашивается второе. Velopack
+# жёстко ставит приложение в папку по имени packId, а `%LocalAppData%\saytype`
 # уже занят профилем пользователя (настройки, словарь, скачанные модели,
 # CUDA-слой — см. profile.py). Совпади имена, установщик у любого, кто уже
 # пользовался приложением, упирается в «папка существует, перезаписать?», а
 # согласие стирает гигабайты скачанного. Плюс деинсталляция сносила бы папку
 # установки вместе с данными. Отображаемое имя задаёт --packTitle, так что в
-# меню и в «Установке и удалении программ» видно нормальное «iWhisper».
+# меню и в «Установке и удалении программ» видно нормальное «SayType».
 Write-Output "== vpk pack $Version =="
 & $vpk pack `
-    --packId iwhisper-app `
+    --packId saytype-app `
     --packVersion $Version `
-    --packDir "dist\iwhisper" `
-    --mainExe "iwhisper.exe" `
-    --packTitle "iWhisper" `
-    --packAuthors "iwhisper contributors" `
-    --icon "assets\iwhisper.ico" `
+    --packDir "dist\saytype" `
+    --mainExe "saytype.exe" `
+    --packTitle "SayType" `
+    --packAuthors "SayType contributors" `
+    --icon "assets\saytype.ico" `
     --outputDir $OutputDir
 if ($LASTEXITCODE -ne 0) { throw "vpk pack упал (код $LASTEXITCODE)" }
 
 # --- Публикация ---
 if ($Github) {
     Write-Output "== vpk upload github =="
-    & $vpk upload github --repoUrl $RepoUrl --publish --releaseName "iWhisper $Version" --tag "v$Version" --outputDir $OutputDir
+    & $vpk upload github --repoUrl $RepoUrl --publish --releaseName "SayType $Version" --tag "v$Version" --outputDir $OutputDir
     if ($LASTEXITCODE -ne 0) { throw "vpk upload упал (код $LASTEXITCODE)" }
 } else {
     Write-Output "== локальный фид: $((Resolve-Path $OutputDir).Path) =="
     Write-Output "   приложение возьмёт обновления отсюда, если задать переменную:"
-    Write-Output "   `$env:IWHISPER_UPDATE_FEED = '$((Resolve-Path $OutputDir).Path)'"
+    Write-Output "   `$env:SAYTYPE_UPDATE_FEED = '$((Resolve-Path $OutputDir).Path)'"
 }
 
 Get-ChildItem $OutputDir -File | Sort-Object Length -Descending |

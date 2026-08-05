@@ -16,11 +16,11 @@ batch-CLI. Здесь она одна.
 Из всего пакета модуль знает только про `profile` (где лежат веса) — ни PySide6,
 ни UI-слоя здесь нет, поэтому его можно использовать отдельно для batch-расшифровки::
 
-    from iwhisper import engine
+    from saytype import engine
     model = engine.load_model("small")
 
 Тяжёлые импорты (faster_whisper, huggingface_hub) — ленивые, чтобы
-`from iwhisper import engine` из UI-слоя оставался дешёвым.
+`from saytype import engine` из UI-слоя оставался дешёвым.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def setup_cuda_dll_paths() -> list[Path]:
 
     Два источника, в таком порядке:
 
-    1. Докачанный слой в профиле пользователя (`%LOCALAPPDATA%\\iwhisper\\cuda\\bin`)
+    1. Докачанный слой в профиле пользователя (`%LOCALAPPDATA%\\saytype\\cuda\\bin`)
        — так CUDA приезжает к собранному приложению, внутри которого никакого
        site-packages нет вообще (см. `cuda_layer.py`).
     2. pip-пакеты nvidia-cublas-cu12 / nvidia-cudnn-cu12 в site-packages — путь
@@ -555,7 +555,7 @@ def list_cached_models() -> list[dict]:
     """Все whisper-модели в кэшах: `{repo, path, bytes, where}` (наша папка + общий HF)."""
     out: list[dict] = []
     seen: set[str] = set()
-    for where, root in (("iwhisper", models_root()), ("hf-cache", default_hf_cache())):
+    for where, root in (("saytype", models_root()), ("hf-cache", default_hf_cache())):
         if root is None or not root.exists():
             continue
         for d in root.glob("models--*"):

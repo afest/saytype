@@ -1,6 +1,6 @@
 """Точка входа для собранного приложения (PyInstaller).
 
-Отдельный файл, а не `src/iwhisper/__main__.py`: бутлоадер запускает скрипт как
+Отдельный файл, а не `src/saytype/__main__.py`: бутлоадер запускает скрипт как
 `__main__`, и относительный импорт `from .transcribe_ui import run` в нём не
 разрешится. Здесь импорт абсолютный, а всё остальное делает сам пакет.
 
@@ -19,6 +19,6 @@ try:
 except ImportError:
     pass  # запуск из исходников без velopack — обновления просто недоступны
 
-from iwhisper.transcribe_ui import run
+from saytype.transcribe_ui import run
 
 run()

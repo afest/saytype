@@ -1,6 +1,6 @@
-﻿# Проверка собранного iwhisper на чистой Windows (Windows Sandbox).
+﻿# Проверка собранного saytype на чистой Windows (Windows Sandbox).
 #
-# Запускается автоматически как LogonCommand из iwhisper.wsb. Внутри песочницы
+# Запускается автоматически как LogonCommand из saytype.wsb. Внутри песочницы
 # нет ни Python, ни CUDA, ни Visual C++ Redistributable — ровно то, что нужно
 # проверить. Отчёт и логи складываются в проброшенную папку C:\out.
 #
@@ -16,7 +16,7 @@
 
 $ErrorActionPreference = "Continue"
 $out = "C:\out"
-$app = "C:\iwhisper\iwhisper.exe"
+$app = "C:\saytype\saytype.exe"
 $report = "$out\report.txt"
 $stderr = "$out\stderr.log"
 
@@ -26,7 +26,7 @@ function Say($msg) {
     Add-Content -Path $report -Value $line -Encoding utf8
 }
 
-Set-Content -Path $report -Value "=== iwhisper: проверка на чистой Windows ===" -Encoding utf8
+Set-Content -Path $report -Value "=== saytype: проверка на чистой Windows ===" -Encoding utf8
 Say "ОС: $((Get-CimInstance Win32_OperatingSystem).Caption) $((Get-CimInstance Win32_OperatingSystem).Version)"
 
 $py = Get-Command python.exe -ErrorAction SilentlyContinue
@@ -45,7 +45,7 @@ $deadline = (Get-Date).AddMinutes(6)
 $loaded = $false
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 10
-    $alive = Get-Process -Name "iwhisper" -ErrorAction SilentlyContinue
+    $alive = Get-Process -Name "saytype" -ErrorAction SilentlyContinue
     if (-not $alive) { Say "ПРОЦЕСС УМЕР"; break }
     if (Test-Path $stderr) {
         $log = Get-Content $stderr -Raw -ErrorAction SilentlyContinue
@@ -57,7 +57,7 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 
-$alive = Get-Process -Name "iwhisper" -ErrorAction SilentlyContinue
+$alive = Get-Process -Name "saytype" -ErrorAction SilentlyContinue
 Say ("Процесс жив: " + [bool]$alive)
 if ($alive) {
     $wins = @($alive | Where-Object { $_.MainWindowHandle -ne 0 })
@@ -71,7 +71,7 @@ if (Test-Path $stderr) {
     Say "Упоминаний CUDA в логе: $cudaComplaints (ожидаем строку «CUDA-рантайм не найден», не ошибки)"
 }
 
-$crash = "$env:LOCALAPPDATA\iwhisper\runtime\_crash.log"
+$crash = "$env:LOCALAPPDATA\saytype\runtime\_crash.log"
 if (Test-Path $crash) {
     Say "ЕСТЬ _crash.log:"
     Copy-Item $crash "$out\_crash.log" -Force
@@ -80,7 +80,7 @@ if (Test-Path $crash) {
     Say "_crash.log отсутствует — аварий не было"
 }
 
-$profileDir = "$env:LOCALAPPDATA\iwhisper"
+$profileDir = "$env:LOCALAPPDATA\saytype"
 if (Test-Path $profileDir) {
     Say "Профиль создан: $profileDir"
     Get-ChildItem $profileDir | ForEach-Object { Say "  $($_.Name)" }

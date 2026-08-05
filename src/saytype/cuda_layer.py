@@ -6,7 +6,7 @@
 Поэтому базовая сборка идёт с CPU-рантаймом CTranslate2, а CUDA докачивается
 отдельным архивом при первом запуске — и только если в машине нашлась NVIDIA.
 
-Куда кладём: ``%LOCALAPPDATA%\\iwhisper\\cuda\\bin`` (плоско, все DLL рядом —
+Куда кладём: ``%LOCALAPPDATA%\\saytype\\cuda\\bin`` (плоско, все DLL рядом —
 cuDNN ищет cuBLAS обычным DLL search, так что общая папка избавляет от возни с
 порядком подключения). Путь подхватывает ``engine.setup_cuda_dll_paths()``.
 
@@ -42,24 +42,25 @@ from . import profile
 # Меняется вместе с ними: маркер в профиле хранит эту строку, и при несовпадении
 # слой считается устаревшим и качается заново.
 LAYER_VERSION = "cu12.9-cudnn9.21"
-LAYER_FILENAME = f"iwhisper-cuda-{LAYER_VERSION}.zip"
+LAYER_FILENAME = f"saytype-cuda-{LAYER_VERSION}.zip"
 
 # Публикуется в GitHub Releases рядом с релизом приложения. До первого релиза
 # заполняется через переменные окружения ниже — это же используется в тестах.
 LAYER_URL = (
-    "https://github.com/afest/iwhisper/releases/download/"
+    "https://github.com/afest/saytype/releases/download/"
     f"cuda-layer-{LAYER_VERSION}/{LAYER_FILENAME}"
 )
-# Значения от архива, собранного tools/build_cuda_layer.py --minimal 2026-07-30.
+# Значения от архива, собранного tools/build_cuda_layer.py --minimal 2026-08-05
+# (T-314: пересобран с текстами лицензий NVIDIA внутри — суммы изменились).
 # Пересобрали слой — пересчитайте оба поля, иначе проверка целостности отвергнет
 # честный файл (пустой SHA = проверку пропускаем, так делать только при отладке).
-LAYER_SHA256 = "355be4a1f1b0a4b6e51d7b10d6bca5397a62ac81b7705713f89325d2ca0aed5e"
-LAYER_SIZE_BYTES = 553_082_527
+LAYER_SHA256 = "c07d562a0ff2955202ae87292012b28350eaaf69fb63049bd2afc5fa6f6d39fa"
+LAYER_SIZE_BYTES = 553_103_811
 
 # Отладочные переопределения: file:///... или http://localhost/... для проверки
 # всего пути до того, как архив выложен в Releases.
-ENV_URL = "IWHISPER_CUDA_LAYER_URL"
-ENV_SHA256 = "IWHISPER_CUDA_LAYER_SHA256"
+ENV_URL = "SAYTYPE_CUDA_LAYER_URL"
+ENV_SHA256 = "SAYTYPE_CUDA_LAYER_SHA256"
 
 # Минимальный набор — по нему проверяем, что распакованное годно к работе.
 REQUIRED_DLLS = ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll")
@@ -222,7 +223,7 @@ def _open(url: str, offset: int = 0):
     с начала» — уже скачанное придётся выбросить. file:// Range не умеет, там
     всегда с начала (но это локальный источник, терять нечего).
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "iwhisper"})
+    req = urllib.request.Request(url, headers={"User-Agent": "saytype"})
     if offset and urllib.parse.urlparse(url).scheme in ("http", "https"):
         req.add_header("Range", f"bytes={offset}-")
     resp = urllib.request.urlopen(req, timeout=60)
@@ -336,6 +337,18 @@ def _sha256(path: Path) -> str:
 
 
 # === Установка ===
+# Имя файла лицензии внутри архива слоя — то, что кладёт `pack_from_site_packages`.
+# Шаблон узкий сознательно: распаковка обязана оставаться защитой от мусора в
+# архиве, а не превращаться в «тащим всё, что не .exe». Всё, что под шаблон не
+# подошло, в профиль пользователя не попадает.
+LICENSE_NAME_PREFIX = "NVIDIA-"
+LICENSE_NAME_SUFFIX = "-License.txt"
+
+
+def _is_license_name(name: str) -> bool:
+    return name.startswith(LICENSE_NAME_PREFIX) and name.endswith(LICENSE_NAME_SUFFIX)
+
+
 def install(archive: Path) -> Path:
     """Распаковать архив в `cuda/bin`, заменив прежний слой целиком.
 
@@ -354,7 +367,7 @@ def install(archive: Path) -> Path:
                 if info.is_dir():
                     continue
                 name = Path(info.filename).name
-                if not name.lower().endswith(".dll"):
+                if not (name.lower().endswith(".dll") or _is_license_name(name)):
                     continue
                 # Плоско: имя файла, а не путь из архива — защита и от zip-slip,
                 # и от вложенности вида nvidia/cublas/bin/*.dll
@@ -383,7 +396,7 @@ def install(archive: Path) -> Path:
             shutil.rmtree(staging, ignore_errors=True)
             raise LayerError(
                 f"Прежний CUDA-слой занят другим процессом ({exc}). "
-                "Закройте вторую копию iWhisper и повторите."
+                "Закройте вторую копию SayType и повторите."
             ) from exc
     staging.replace(target)
     shutil.rmtree(old, ignore_errors=True)
@@ -463,6 +476,32 @@ def installed_bytes() -> int:
 
 
 # === Сборка архива (вызывается из tools/build_cuda_layer.py) ===
+def license_files(sources: list[Path]) -> list[tuple[str, Path]]:
+    """Тексты лицензий NVIDIA из пакетов, откуда взяты DLL.
+
+    Библиотеки NVIDIA проприетарные и распространяются по условиям, а не
+    свободно: CUDA EULA требует, чтобы файлы шли частью приложения и не
+    раздавались отдельным продуктом. Значит, текст обязан ехать вместе с
+    архивом, а не лежать где-то в репозитории (T-314, модуль M1 методички).
+
+    Ищем `*.dist-info/licenses/License.txt` того пакета, из чьего `bin` взяты
+    DLL: путь вида `<site-packages>/nvidia/<продукт>/bin`.
+    """
+    out: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for src in sources:
+        product = src.parent.name              # cublas, cudnn, cuda_nvrtc
+        site_dir = src.parent.parent.parent     # site-packages
+        for dist in site_dir.glob(f"nvidia_{product}_*.dist-info"):
+            for candidate in dist.rglob("License.txt"):
+                name = f"NVIDIA-{product}-License.txt"
+                if name in seen:
+                    continue
+                seen.add(name)
+                out.append((name, candidate))
+    return out
+
+
 def pack_from_site_packages(
     out_path: Path, sources: list[Path], with_cudnn: bool = True
 ) -> tuple[Path, str, int]:
@@ -471,22 +510,32 @@ def pack_from_site_packages(
     Живёт здесь, а не в сборочном скрипте, чтобы упаковка и распаковка не
     разъехались по формату: раскладку архива знает один модуль.
     `with_cudnn=False` даёт минимальный слой — только то, что реально грузится.
+
+    Вместе с DLL в архив кладутся тексты лицензий NVIDIA — см. `license_files`.
     """
     wanted = {n.lower() for n in LAYER_DLLS_CORE}
     if with_cudnn:
         wanted |= {n.lower() for n in LAYER_DLLS_CUDNN}
     out_path.parent.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
+    packed_sources: list[Path] = []
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp)
         for src in sources:
+            took = False
             for dll in src.glob("*.dll"):
                 key = dll.name.lower()
                 if key in seen or key not in wanted:
                     continue
                 seen.add(key)
+                took = True
                 shutil.copy2(dll, staging / dll.name)
+            if took:
+                packed_sources.append(src)
         with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for dll in sorted(staging.glob("*.dll")):
                 zf.write(dll, arcname=f"bin/{dll.name}")
+            # Лицензии — только тех пакетов, чьи DLL реально попали в архив.
+            for name, path in license_files(packed_sources):
+                zf.write(path, arcname=f"bin/{name}")
     return out_path, _sha256(out_path), out_path.stat().st_size

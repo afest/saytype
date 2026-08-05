@@ -25,7 +25,7 @@
 
 Standalone::
 
-    python -m iwhisper.transcribe_call --duration 60
+    python -m saytype.transcribe_call --duration 60
 
 Программно::
 
@@ -70,7 +70,7 @@ except Exception:
 
 
 # === Константы записи (зеркало transcribe_ui.py) ===
-MIC_SAMPLE_RATE = 16000          # стандарт iwhisper
+MIC_SAMPLE_RATE = 16000          # стандарт saytype
 MIC_CHANNELS = 1
 PRE_ROLL_MS = 100                # тишина-прогрев в начало обоих буферов
 MIC_BLOCKSIZE = 1024
@@ -591,9 +591,9 @@ class CallRecorder:
             if self._mic_start_error is not None:
                 raise RuntimeError(
                     f"mic-поток не стартовал ({self._mic_start_error!r}). "
-                    f"Частая причина: устройство занято (запущен daily-driver iwhisper "
+                    f"Частая причина: устройство занято (запущен daily-driver saytype "
                     f"и держит микрофон под pre-roll) или не поддерживает 16kHz/mono/float32. "
-                    f"Закрой UI iwhisper через трей или укажи --mic-device явно."
+                    f"Закрой UI saytype через трей или укажи --mic-device явно."
                 )
             raise RuntimeError("mic не записал ничего — устройство не подаёт сигнал?")
 
@@ -754,7 +754,7 @@ def _read_settings_option(name: str, fallback: str = "") -> str:
 
 
 def _model_spec_from_settings() -> Optional[str]:
-    """Модель из общего ``settings.ini`` iwhisper."""
+    """Модель из общего ``settings.ini`` saytype."""
     key = _read_settings_option("model")
     if not key:
         return None
@@ -926,7 +926,7 @@ def build_markdown(
         "",
         f"# Расшифровка созвона {date}",
         "",
-        f"> Двухканальная расшифровка iwhisper (faster-whisper `{model_label}`, RU). "
+        f"> Двухканальная расшифровка saytype (faster-whisper `{model_label}`, RU). "
         f"L=микрофон ({speaker_l}), R=системный звук ({speaker_r}). **Не редактировать.**",
         audio_note,
         "",
@@ -1223,7 +1223,7 @@ def _parse_mic_device(arg: Optional[str]):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="iwhisper call recorder (standalone)")
+    parser = argparse.ArgumentParser(description="saytype call recorder (standalone)")
     parser.add_argument("--duration", type=float, default=None, help="секунды записи")
     parser.add_argument("--list-devices", action="store_true",
                         help="показать аудио-устройства (default input + WASAPI loopback) и выйти")

@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 from . import cuda_layer, engine
 from .transcribe_ui_window import (
     DEFAULT_HOTKEY,
-    hotkey_to_pynput,
+    hotkey_to_canonical,
     hotkey_to_qt,
     hotkey_conflicts_with_handy,
     parse_hotkey_valid,
@@ -227,7 +227,7 @@ class FirstRunWizard(QDialog):
 
     def __init__(self, current: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("iWhisper — первый запуск")
+        self.setWindowTitle("SayType — первый запуск")
         self.setMinimumSize(560, 460)
         self.setStyleSheet(_STYLE)
         self._current = dict(current)
@@ -445,7 +445,7 @@ class FirstRunWizard(QDialog):
         seq = self.hotkey_edit.keySequence()
         if seq.isEmpty():
             return ""
-        return hotkey_to_pynput(seq.toString())
+        return hotkey_to_canonical(seq.toString())
 
     def _update_model_hint(self) -> None:
         key = self.model_combo.currentData()

@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iwhisper"
+name = "saytype"
 version = "0.1.0"
 description = "GPU-accelerated system-wide dictation and call recording for Windows, built on faster-whisper"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "iwhisper contributors" }]
+authors = [{ name = "saytype contributors" }]
 keywords = ["whisper", "speech-to-text", "dictation", "transcription", "windows", "cuda"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -37,9 +37,9 @@ dependencies = [
     "PySide6>=6.7",
     "pyperclip>=1.9",
     "pillow>=10",
-    # Разбор и валидация hotkey-строк (`<ctrl>+<shift>+q`). Сам перехват идёт
-    # через RegisterHotKey, но формат и парсер — из pynput.
-    "pynput>=1.7",
+    # Разбор hotkey-строк (`<ctrl>+<shift>+q`) — свой, src/saytype/hotkeys.py.
+    # Прежде брали pynput; он под LGPL-3.0, а в замороженной сборке его байткод
+    # оказывается внутри PYZ-архива exe, где заменить библиотеку нельзя (T-318).
 ]
 
 [dependency-groups]
@@ -58,13 +58,13 @@ notify = ["winotify>=1.1"]
 cuda = ["nvidia-cublas-cu12>=12.4", "nvidia-cudnn-cu12>=9.0"]
 
 [project.scripts]
-iwhisper-call = "iwhisper.transcribe_call:main"
+saytype-call = "saytype.transcribe_call:main"
 
 [project.gui-scripts]
-iwhisper = "iwhisper.transcribe_ui:run"
+saytype = "saytype.transcribe_ui:run"
 
 [project.urls]
-Source = "https://github.com/afest/iwhisper"
+Source = "https://github.com/afest/saytype"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -73,4 +73,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-iwhisper = ["assets/*"]
+saytype = ["assets/*"]

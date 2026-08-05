@@ -13,19 +13,19 @@
 $ErrorActionPreference = "Stop"
 
 $repo = Split-Path -Parent $PSScriptRoot
-$dist = Join-Path $repo "dist\iwhisper"
+$dist = Join-Path $repo "dist\saytype"
 $out = Join-Path $repo "dist\sandbox-out"
 $packaging = $PSScriptRoot
 
-if (-not (Test-Path (Join-Path $dist "iwhisper.exe"))) {
-    throw "Нет сборки в $dist — сначала `pyinstaller iwhisper.spec`"
+if (-not (Test-Path (Join-Path $dist "saytype.exe"))) {
+    throw "Нет сборки в $dist — сначала `pyinstaller saytype.spec`"
 }
 if (-not (Test-Path "C:\Windows\System32\WindowsSandbox.exe")) {
     throw "Windows Sandbox не установлен. Включите фичу Containers-DisposableClientVM (нужна перезагрузка)."
 }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-$wsb = Join-Path $env:TEMP "iwhisper-sandbox.wsb"
+$wsb = Join-Path $env:TEMP "saytype-sandbox.wsb"
 @"
 <Configuration>
   <VGpu>Disable</VGpu>
@@ -37,7 +37,7 @@ $wsb = Join-Path $env:TEMP "iwhisper-sandbox.wsb"
   <MappedFolders>
     <MappedFolder>
       <HostFolder>$dist</HostFolder>
-      <SandboxFolder>C:\iwhisper</SandboxFolder>
+      <SandboxFolder>C:\saytype</SandboxFolder>
       <ReadOnly>true</ReadOnly>
     </MappedFolder>
     <MappedFolder>

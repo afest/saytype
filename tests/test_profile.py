@@ -12,12 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 # Профиль резолвится по переменным окружения — уводим его во временную папку,
 # чтобы тест не трогал настоящие настройки того, кто его запускает.
-_TMP = tempfile.mkdtemp(prefix="iwhisper-test-")
+_TMP = tempfile.mkdtemp(prefix="saytype-test-")
 os.environ["LOCALAPPDATA"] = _TMP
 os.environ["XDG_DATA_HOME"] = _TMP
 os.environ.pop("APPDATA", None)  # чтобы не подхватилась миграция старых настроек
 
-from iwhisper import profile  # noqa: E402
+from saytype import profile  # noqa: E402
 
 FAILED = []
 

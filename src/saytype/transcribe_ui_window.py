@@ -32,7 +32,17 @@ from . import profile  # где лежат настройки, словарь и
 from . import updater  # T-262: проверка обновлений через Velopack
 
 from PySide6.QtCore import Qt, QSettings, QUrl, QSize, QMargins, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygon,
+)
 from PySide6.QtCore import QPoint, QRect
 from PySide6.QtCharts import (
     QBarCategoryAxis,
@@ -81,7 +91,7 @@ APPDATA = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"
 SETTINGS_FILE = profile.settings_file()
 SETTINGS_DIR = SETTINGS_FILE.parent
 STARTUP_DIR = APPDATA / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-STARTUP_SHORTCUT_NAME = "iWhisper.lnk"
+STARTUP_SHORTCUT_NAME = "SayType.lnk"
 
 # hotkey хранится в pynput-формате: <ctrl>+<shift>+q (модификаторы в <>, lowercase)
 DEFAULT_HOTKEY = "<ctrl>+<shift>+q"
@@ -111,7 +121,11 @@ DEFAULT_MODEL_EXISTING = "small"
 DEFAULT_SPEAKER_SELF = "Я"
 DEFAULT_SPEAKER_OTHER = "Собеседник"
 
-_HOTKEY_MODIFIERS = {"ctrl", "shift", "alt", "meta", "cmd", "win"}
+# Формат hotkey-строки и её разбор живут в `hotkeys` — одно место правды для
+# настроек, мастера первого запуска и регистрации в Windows (T-318).
+from .hotkeys import to_canonical as hotkey_to_canonical  # noqa: E402
+from .hotkeys import to_qt as hotkey_to_qt  # noqa: E402
+from .hotkeys import validate as parse_hotkey_valid  # noqa: E402
 
 
 # === Векторные иконки через QPainter — гарантированно видны без MDL2 шрифта ===
@@ -337,43 +351,6 @@ def _draw_phone(p: QPainter, r: QRect, c: QColor) -> None:
     p.drawPath(path)
 
 
-def hotkey_to_pynput(s: str) -> str:
-    """Конвертация произвольной hotkey-строки в pynput-формат: '<ctrl>+<shift>+q'.
-
-    Принимает 'Ctrl+Shift+Q' (Qt), 'ctrl+shift+q' (keyboard lib), '<ctrl>+<shift>+q' (pynput).
-    Модификаторы в lowercase оборачиваются в <>. Обычные буквы — lowercase без <>.
-    """
-    if not s:
-        return ""
-    cleaned = s.replace("<", "").replace(">", "")
-    parts = [p.strip().lower() for p in cleaned.split("+") if p.strip()]
-    out = []
-    for p in parts:
-        mod = "cmd" if p in ("meta", "win") else p
-        if mod in _HOTKEY_MODIFIERS:
-            out.append(f"<{mod}>")
-        else:
-            out.append(p)
-    return "+".join(out)
-
-
-def hotkey_to_qt(s: str) -> str:
-    """Конвертация pynput-формата в Qt KeySequence-style ('Ctrl+Shift+Q') для отображения."""
-    if not s:
-        return ""
-    parts = s.split("+")
-    out = []
-    for p in parts:
-        clean = p.replace("<", "").replace(">", "").strip()
-        if not clean:
-            continue
-        if clean.lower() in _HOTKEY_MODIFIERS:
-            out.append(clean.capitalize())
-        else:
-            out.append(clean.upper() if len(clean) == 1 else clean.capitalize())
-    return "+".join(out)
-
-
 def get_settings() -> QSettings:
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     # Настройки раньше жили в %APPDATA%\faster-whisper-ui — подхватываем их один
@@ -382,6 +359,28 @@ def get_settings() -> QSettings:
     if note:
         print(f"[settings] {note}", file=sys.stderr)
     return QSettings(str(SETTINGS_FILE), QSettings.IniFormat)
+
+
+# === Согласие на запись созвона ===
+#
+# Запись разговора без предупреждения собеседника в части стран и штатов
+# незаконна, и приложение не знает, где находится пользователь. Абзац об этом
+# есть в README, но README читают не все — поэтому та же строка показывается
+# один раз в интерфейсе, перед первой записью (T-314, чек-лист публикации A6).
+#
+# Ключ живёт отдельно от общего словаря настроек сознательно: он не
+# редактируется в диалоге настроек, а ставится один раз ответом на вопрос.
+CALL_CONSENT_KEY = "call_consent_acknowledged"
+
+
+def call_consent_acknowledged() -> bool:
+    return _as_bool(get_settings().value(CALL_CONSENT_KEY, False))
+
+
+def set_call_consent_acknowledged(value: bool = True) -> None:
+    s = get_settings()
+    s.setValue(CALL_CONSENT_KEY, bool(value))
+    s.sync()
 
 
 _VALID_PROCESSING_MODES = ("auto", "always_batch", "always_streaming")
@@ -442,7 +441,7 @@ def load_settings_dict() -> dict:
     return {
         "model": model_key,
         "custom_model": custom_model,
-        "hotkey": hotkey_to_pynput(raw_hotkey),  # старые значения (без <>) автоматом нормализуются
+        "hotkey": hotkey_to_canonical(raw_hotkey),  # старые значения (без <>) автоматом нормализуются
         "history_dir": s.value("history_dir", DEFAULT_HISTORY_DIR, type=str),
         "rotation_count": int(s.value("rotation_count", DEFAULT_ROTATION_COUNT)),
         "autostart": _as_bool(s.value("autostart", DEFAULT_AUTOSTART)),
@@ -476,7 +475,7 @@ def load_settings_dict() -> dict:
 
 def save_settings_dict(d: dict) -> None:
     s = get_settings()
-    s.setValue("hotkey", hotkey_to_pynput(d["hotkey"]))
+    s.setValue("hotkey", hotkey_to_canonical(d["hotkey"]))
     s.setValue("history_dir", d["history_dir"])
     s.setValue("rotation_count", int(d["rotation_count"]))
     s.setValue("autostart", bool(d["autostart"]))
@@ -538,8 +537,8 @@ def create_autostart_shortcut(target_script: Path | None = None) -> tuple[bool, 
     разрешит. `target_script` оставлен для совместимости вызовов и используется
     только как рабочая папка.
 
-    В собранном виде (`sys.frozen`) целью становится сам `iwhisper.exe` без
-    аргументов: `-m iwhisper` бутлоадер PyInstaller не понимает и передал бы
+    В собранном виде (`sys.frozen`) целью становится сам `saytype.exe` без
+    аргументов: `-m saytype` бутлоадер PyInstaller не понимает и передал бы
     строку приложению как argv — автозапуск молча ломался бы (T-261).
 
     Возвращает (success, message). message — пояснение для UI на случай fail.
@@ -553,7 +552,7 @@ def create_autostart_shortcut(target_script: Path | None = None) -> tuple[bool, 
         target = Path(sys.executable).with_name("pythonw.exe")
         if not target.exists():
             target = Path(sys.executable)
-        arguments = "-m iwhisper"
+        arguments = "-m saytype"
         working_dir = (target_script or Path(__file__).resolve()).parent
     STARTUP_DIR.mkdir(parents=True, exist_ok=True)
     shortcut_path = STARTUP_DIR / STARTUP_SHORTCUT_NAME
@@ -1049,16 +1048,6 @@ def _build_buckets_chart(records: list[dict], mode_filter: str = "all") -> QChar
     return chart
 
 
-def parse_hotkey_valid(hotkey: str) -> tuple[bool, str]:
-    """Проверка hotkey через pynput.HotKey.parse. Возвращает (ok, msg)."""
-    try:
-        from pynput import keyboard as pnk
-        pnk.HotKey.parse(hotkey)
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
-
-
 def hotkey_conflicts_with_handy(hotkey: str) -> bool:
     """Проверка пересечения с Handy (`ctrl_left+\\``) или с базовыми ОС-шорткатами."""
     h = hotkey.replace(" ", "").lower()
@@ -1068,8 +1057,118 @@ def hotkey_conflicts_with_handy(hotkey: str) -> bool:
     return h in reserved_pnp
 
 
+# === О программе ===
+
+# Компоненты под LGPL-3.0, которые едут в поставке. Ссылка ведёт на исходники
+# ИМЕННО ТОЙ версии, что собрана: обязательство LGPL — дать возможность собрать
+# замену конкретной библиотеке, а «последняя версия на сайте» этого не даёт.
+# Версия читается у самой библиотеки, а не пишется руками: константа в коде
+# разъедется с содержимым сборки на первом же обновлении зависимости.
+# Версия FFmpeg, который Qt кладёт рядом с Qt Multimedia (avcodec/avformat/…).
+# Программно её не спросить, поэтому константа — и сверять её надо при каждом
+# обновлении PySide6: строка `--prefix=/c/FFmpeg-<версия>/…` лежит внутри
+# `_internal/PySide6/avutil-*.dll` собранного приложения.
+FFMPEG_VERSION = "n7.1.3"
+
+
+def _lgpl_components() -> list[tuple[str, str, str]]:
+    """[(название, версия, ссылка на исходники этой версии)]."""
+    try:
+        from PySide6 import __version__ as pyside_version
+    except Exception:
+        pyside_version = "?"
+    return [
+        (
+            "PySide6 (Qt for Python) и Qt — LGPL-3.0",
+            pyside_version,
+            "https://download.qt.io/official_releases/QtForPython/"
+            f"pyside6/PySide6-{pyside_version}-src/",
+        ),
+        (
+            # Едет внутри Qt Multimedia, отдельной зависимостью не является.
+            # Сборка Qt идёт без --enable-gpl: libx264/libx265 в ней нет,
+            # проверено по строке конфигурации в самой avcodec (T-318).
+            "FFmpeg в составе Qt Multimedia — LGPL-2.1+",
+            FFMPEG_VERSION,
+            f"https://github.com/FFmpeg/FFmpeg/releases/tag/{FFMPEG_VERSION}",
+        ),
+    ]
+
+
+# Версия FFmpeg, который Qt кладёт рядом с Qt Multimedia (avcodec/avformat/…).
+# Из самих DLL её на лету не достать, поэтому константа — и сверять её надо при
+# каждом обновлении PySide6: строка `--prefix=/c/FFmpeg-<версия>/…` лежит внутри
+# `_internal/PySide6/avutil-*.dll`.
+FFMPEG_VERSION = "n7.1.3"
+
+
+class AboutDialog(QDialog):
+    """Что это, какой версии и на чьём коде работает.
+
+    Существует не ради красоты: LGPL-3.0 требует сообщить пользователю, что в
+    программе есть такие компоненты, и дать дорогу к их исходникам. Место, где
+    человек это ищет, — «О программе», а не файл в папке установки.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("О программе")
+        self.setMinimumWidth(460)
+
+        from . import __version__
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
+
+        title = QLabel(f"SayType {__version__}")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        layout.addWidget(title)
+
+        summary = QLabel(
+            "Диктовка и запись созвонов с локальным распознаванием речи.\n"
+            "Код приложения — под лицензией MIT."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color: #E7E7EA;")
+        layout.addWidget(line)
+
+        parts = [
+            "<b>Компоненты под LGPL-3.0</b><br>"
+            "Поставляются отдельными файлами рядом с приложением, а не вшиты в exe, "
+            "поэтому их можно заменить своей сборкой той же версии."
+        ]
+        for name, version, url in _lgpl_components():
+            parts.append(f"{name} — {version}<br>Исходники: <a href='{url}'>{url}</a>")
+        lgpl = QLabel("<br><br>".join(parts))
+        lgpl.setWordWrap(True)
+        lgpl.setOpenExternalLinks(True)
+        lgpl.setTextFormat(Qt.RichText)
+        layout.addWidget(lgpl)
+
+        buttons = QDialogButtonBox()
+        licenses_btn = buttons.addButton("Тексты лицензий", QDialogButtonBox.ActionRole)
+        licenses_btn.clicked.connect(self._open_licenses)
+        licenses_path = profile.licenses_dir()
+        if not licenses_path.exists():
+            licenses_btn.setEnabled(False)
+            licenses_btn.setToolTip(f"Папка не найдена: {licenses_path}")
+        buttons.addButton(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _open_licenses(self) -> None:
+        path = profile.licenses_dir()
+        if path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
 class _EqualizerBars(QWidget):
-    """4 bar-эквалайзер по `.eq` из iwhisper.css: width 22, gap 2, bar 3px, radius 1."""
+    """4 bar-эквалайзер по `.eq` из saytype.css: width 22, gap 2, bar 3px, radius 1."""
 
     def __init__(self, parent=None, color="#FFFFFF", height=16):
         super().__init__(parent)
@@ -1743,7 +1842,7 @@ class _PrimaryActionButton(QFrame):
 
 
 def _build_empty_widget() -> QWidget:
-    """Empty state по `.empty` из iwhisper.css: padding 32, gap 12, mic 56×56 в круге."""
+    """Empty state по `.empty` из saytype.css: padding 32, gap 12, mic 56×56 в круге."""
     w = QWidget()
     w.setStyleSheet("background: transparent;")
     lay = QVBoxLayout(w)
@@ -2029,7 +2128,7 @@ class CallHistoryCard(QFrame):
 
 
 class SettingsDialog(QDialog):
-    """Настройки iWhisper по Claude Design v2.
+    """Настройки SayType по Claude Design v2.
 
     Структура:
     - settings-body с form rows (label-150 / input-1fr / action-auto), inputs h:34 r:8.
@@ -2047,7 +2146,7 @@ class SettingsDialog(QDialog):
         # T-261: прежний отказ от CUDA-слоя и запрос скачивания из этого диалога
         self._cuda_declined = bool(current.get("cuda_layer_declined", False))
         self._cuda_requested = False
-        self.setWindowTitle("Настройки iWhisper")
+        self.setWindowTitle("Настройки SayType")
         self.setMinimumWidth(560)
         # Dialog-локальный стиль — переопределяет глобальный QPushButton (он pill для primary).
         self.setStyleSheet(
@@ -2808,14 +2907,14 @@ class SettingsDialog(QDialog):
         self.accept()
         download_cuda_layer(parent=self.parent())
 
-    def _hotkey_pynput(self) -> str:
+    def _hotkey_canonical(self) -> str:
         seq = self.hotkey_edit.keySequence()
         if seq.isEmpty():
             return ""
-        return hotkey_to_pynput(seq.toString())
+        return hotkey_to_canonical(seq.toString())
 
     def _validate_and_accept(self) -> None:
-        hotkey = self._hotkey_pynput()
+        hotkey = self._hotkey_canonical()
         if not hotkey:
             QMessageBox.warning(self, "Hotkey", "Hotkey не может быть пустым. Кликни в поле и нажми сочетание.")
             return
@@ -2849,7 +2948,7 @@ class SettingsDialog(QDialog):
         return {
             "model": self._current_model_key,
             "custom_model": self._current_custom_model,
-            "hotkey": self._hotkey_pynput(),
+            "hotkey": self._hotkey_canonical(),
             "history_dir": self.path_edit.text().strip(),
             "rotation_count": int(self.count_spin.value()),
             "autostart": bool(self.autostart_box.isChecked()),
@@ -3616,7 +3715,7 @@ class StatsDialog(QDialog):
 
     def __init__(self, parent: QMainWindow | None, stats_path: Path) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Статистика iWhisper")
+        self.setWindowTitle("Статистика SayType")
         self.setMinimumSize(800, 740)
         # Dialog-локальный стиль (chip, stats-row, tab, footer hairline)
         self.setStyleSheet(
@@ -4003,7 +4102,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self._model_busy_getter = model_busy_getter  # T-259: занят ли движок прямо сейчас
-        self.setWindowTitle("iWhisper")
+        self.setWindowTitle("SayType")
         self.resize(760, 620)
 
         self._idle_icon = QIcon(str(idle_icon_path))
@@ -4014,7 +4113,7 @@ class MainWindow(QMainWindow):
         self._app_icon = QIcon(str(app_icon_path)) if app_icon_path else self._idle_icon
         self.setWindowIcon(self._app_icon)  # для заголовка окна / taskbar
 
-        # === Глобальный стиль приложения (Claude Design tokens, iwhisper.css v2) ===
+        # === Глобальный стиль приложения (Claude Design tokens, saytype.css v2) ===
         # Тёплая нейтральная палитра. Хардкод hex, QSS без переменных.
         # Шрифт — Segoe UI Variable Display (Win11 native), fallback Segoe UI.
         self.setStyleSheet("""
@@ -4199,7 +4298,7 @@ class MainWindow(QMainWindow):
             if not self._call_timer.isActive():
                 self._call_timer.start()
             self._tray.setIcon(self._recording_icon)
-            self._tray.setToolTip("iWhisper · запись созвона")
+            self._tray.setToolTip("SayType · запись созвона")
         else:
             self._call_processing = False
             self._call_timer.stop()
@@ -4207,7 +4306,7 @@ class MainWindow(QMainWindow):
             # tray в idle только если прямо сейчас не идёт диктовка (у неё свой set_state)
             if self._state not in ("recording", "processing"):
                 self._tray.setIcon(self._idle_icon)
-                self._tray.setToolTip("iWhisper · готов")
+                self._tray.setToolTip("SayType · готов")
         if hasattr(self, "call_btn"):
             if active:
                 self.call_btn.setIcon(self._ico_phone_blue)
@@ -4238,7 +4337,7 @@ class MainWindow(QMainWindow):
             if not self._call_timer.isActive():
                 self._call_timer.start()
             self._tray.setIcon(self._processing_icon)
-            self._tray.setToolTip("iWhisper · обработка созвона…")
+            self._tray.setToolTip("SayType · обработка созвона…")
         else:
             self._call_overlay.hide_overlay()
 
@@ -4491,10 +4590,13 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.show_window)
         settings_action = QAction("Настройки…", self)
         settings_action.triggered.connect(self.open_settings)
+        about_action = QAction("О программе…", self)
+        about_action.triggered.connect(self.open_about)
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(self._quit)
         menu.addAction(open_action)
         menu.addAction(settings_action)
+        menu.addAction(about_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
@@ -4541,20 +4643,20 @@ class MainWindow(QMainWindow):
         # Tray
         if state == "recording":
             self._tray.setIcon(self._recording_icon)
-            self._tray.setToolTip("iWhisper · запись")
+            self._tray.setToolTip("SayType · запись")
         elif state == "processing":
             self._tray.setIcon(self._processing_icon)
-            self._tray.setToolTip("iWhisper · транскрибирую…")
+            self._tray.setToolTip("SayType · транскрибирую…")
         elif self._call_processing:
             # T-173: диктовка во время созвона вернулась в idle, но созвон ещё обрабатывается
             self._tray.setIcon(self._processing_icon)
-            self._tray.setToolTip("iWhisper · обработка созвона…")
+            self._tray.setToolTip("SayType · обработка созвона…")
         elif self._call_active:
             self._tray.setIcon(self._recording_icon)
-            self._tray.setToolTip("iWhisper · запись созвона")
+            self._tray.setToolTip("SayType · запись созвона")
         else:
             self._tray.setIcon(self._idle_icon)
-            self._tray.setToolTip("iWhisper · готов")
+            self._tray.setToolTip("SayType · готов")
 
     @Slot()
     def _tick_rec_time(self) -> None:
@@ -4744,6 +4846,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Папка истории", f"Папка ещё не создана:\n{hdir}")
         except Exception as exc:
             QMessageBox.warning(self, "Папка истории", str(exc))
+
+    def open_about(self) -> None:
+        AboutDialog(self).exec()
 
     def open_settings(self) -> None:
         current = load_settings_dict()

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from iwhisper import __version__, updater
+from saytype import __version__, updater
 
 
 @pytest.fixture(autouse=True)

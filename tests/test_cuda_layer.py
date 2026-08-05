@@ -19,16 +19,19 @@ from pathlib import Path
 
 import pytest
 
-from iwhisper import cuda_layer
+from saytype import cuda_layer
 
 
 def _make_archive(payload_size: int = 300_000) -> bytes:
-    """Zip той же раскладки, что настоящий слой: bin/<нужные DLL>."""
+    """Zip той же раскладки, что настоящий слой: bin/<нужные DLL> + лицензии."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
         for name in cuda_layer.REQUIRED_DLLS:
             zf.writestr(f"bin/{name}", b"\x4d\x5a" + b"x" * payload_size)
-        zf.writestr("bin/readme.txt", "не DLL — распаковщик должен это пропустить")
+        # T-314: тексты лицензий NVIDIA едут вместе с библиотеками и обязаны
+        # оказаться рядом с ними на машине пользователя.
+        zf.writestr("bin/NVIDIA-cublas-License.txt", "End User License Agreement")
+        zf.writestr("bin/readme.txt", "не DLL и не лицензия — распаковщик пропускает")
     return buf.getvalue()
 
 
@@ -138,9 +141,27 @@ def test_install_unpacks_flat_and_marks_version(server, profile_home, tmp_path):
 
     names = {p.name for p in target.glob("*")}
     assert set(cuda_layer.REQUIRED_DLLS) <= names
-    assert "readme.txt" not in names, "в bin/ должны попадать только DLL"
+    assert "readme.txt" not in names, "в bin/ должны попадать только DLL и лицензии"
     assert cuda_layer.installed_version() == cuda_layer.LAYER_VERSION
     assert cuda_layer.is_installed()
+
+
+def test_install_keeps_license_texts(profile_home, tmp_path):
+    """Тексты лицензий NVIDIA обязаны оказаться рядом с библиотеками.
+
+    Условие CUDA EULA — файлы распространяются как часть приложения, и текст
+    лицензии идёт вместе с ними (T-314). Если распаковка их выбросит, у
+    пользователя останутся проприетарные DLL без единого слова об условиях.
+    """
+    archive = tmp_path / "layer.zip"
+    archive.write_bytes(_make_archive())
+
+    target = cuda_layer.install(archive)
+
+    names = {p.name for p in target.glob("*")}
+    assert "NVIDIA-cublas-License.txt" in names
+    body = (target / "NVIDIA-cublas-License.txt").read_text(encoding="utf-8")
+    assert body.strip(), "пустой файл лицензии не считается"
 
 
 def test_incomplete_archive_is_refused(profile_home, tmp_path):

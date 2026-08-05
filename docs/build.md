@@ -1,6 +1,6 @@
 # Сборка дистрибутива
 
-Как из исходников получить папку с `iwhisper.exe`, которая запускается на
+Как из исходников получить папку с `saytype.exe`, которая запускается на
 Windows **без Python, без CUDA Toolkit и без ffmpeg**.
 
 ## Быстрый путь
@@ -8,16 +8,46 @@ Windows **без Python, без CUDA Toolkit и без ffmpeg**.
 ```powershell
 pip install --user -r requirements.txt
 pip install --user pyinstaller
-pyinstaller iwhisper.spec
+pyinstaller saytype.spec
 ```
 
-Результат — `dist/iwhisper/`. Запускается `dist\iwhisper\iwhisper.exe`; рядом
-лежит `iwhisper-selftest.exe` — консольная самопроверка на случай, когда
+Результат — `dist/saytype/`. Запускается `dist\saytype\saytype.exe`; рядом
+лежит `saytype-selftest.exe` — консольная самопроверка на случай, когда
 оконное приложение не появилось и непонятно почему.
 
 Собирать нужно **тем же интерпретатором**, которым запускается приложение. Если
 в PATH лежит чужой venv, зовите Python полным путём — иначе сборка молча уедет
 на другой набор пакетов.
+
+## Лицензии сторонних компонентов: два прохода
+
+`licenses/THIRD-PARTY-LICENSES.txt` собирается по **фактическому составу
+сборки** (TOC PyInstaller), а сам кладётся внутрь этой сборки. Отсюда порядок:
+
+```powershell
+pyinstaller saytype.spec          # проход 1 — узнаём состав
+python tools/collect_licenses.py  # пересчитываем список
+pyinstaller saytype.spec          # проход 2 — кладём актуальный список
+```
+
+`release.ps1` делает это сам и второй проход запускает, только если список
+изменился. Вручную второй проход нужен, когда менялись зависимости.
+
+Считать список по `requirements.txt` было бы дешевле и неправильно: зависимости
+описывают намерение, а обязательства возникают перед тем, что человек получил
+на руки. Ровно на этом расхождении прежний NOTICE утверждал, что PyAV и pynput
+в поставку не идут, хотя оба там лежали (T-318).
+
+Проверка, что в поставке нет GPL-кода:
+
+```powershell
+Get-ChildItem dist\saytype -Recurse -File |
+    Where-Object { $_.FullName -match 'av\.libs|libx264|libx265' }
+```
+
+Пусто — значит чисто. FFmpeg-библиотеки внутри `_internal\PySide6\` — не отсюда:
+их кладёт Qt Multimedia, они собраны без `--enable-gpl` и идут под LGPL-2.1.
+Проверяется строкой конфигурации внутри `avutil-*.dll`.
 
 ## Почему onedir, а не onefile
 
@@ -45,7 +75,7 @@ pyinstaller iwhisper.spec
 | onnxruntime | 32 | нет, на нём VAD-фильтр Silero |
 | numpy (+ `numpy.libs`) | 26 | нет |
 | PIL | 13 | да, если генерировать иконки трея заранее, а не в рантайме |
-| iwhisper-selftest.exe | 10 | да, если отказаться от самопроверки |
+| saytype-selftest.exe | 10 | да, если отказаться от самопроверки |
 | tcl/tk (splash до загрузки Qt) | 7 | да, но splash тогда придётся переписать на средства PyInstaller |
 | tokenizers, hf_xet, faster_whisper, tcl/tk, прочее | 69 | частично |
 
@@ -71,7 +101,7 @@ python tools/build_cuda_layer.py --minimal
 ```
 
 Скрипт печатает SHA-256 и размер — их надо вписать в `LAYER_SHA256` и
-`LAYER_SIZE_BYTES` в [`src/iwhisper/cuda_layer.py`](../src/iwhisper/cuda_layer.py),
+`LAYER_SIZE_BYTES` в [`src/saytype/cuda_layer.py`](../src/saytype/cuda_layer.py),
 а `LAYER_URL` привести к адресу, по которому архив реально лежит. Пересобрали
 слой — обновите оба поля, иначе проверка целостности отвергнет честный файл.
 
@@ -90,12 +120,12 @@ cuDNN-графов не доходит. Полный набор (`без --minim
 ### Проверить докачку, не выкладывая архив в сеть
 
 ```powershell
-$env:IWHISPER_CUDA_LAYER_URL   = "file:///$((Resolve-Path dist\iwhisper-cuda-cu12.9-cudnn9.21.zip).Path -replace '\\','/')"
-$env:IWHISPER_CUDA_LAYER_SHA256 = "<sha из вывода скрипта>"
-dist\iwhisper\iwhisper.exe
+$env:SAYTYPE_CUDA_LAYER_URL   = "file:///$((Resolve-Path dist\saytype-cuda-cu12.9-cudnn9.21.zip).Path -replace '\\','/')"
+$env:SAYTYPE_CUDA_LAYER_SHA256 = "<sha из вывода скрипта>"
+dist\saytype\saytype.exe
 ```
 
-Слой ставится в `%LOCALAPPDATA%\iwhisper\cuda\bin`, оттуда его подхватывает
+Слой ставится в `%LOCALAPPDATA%\saytype\cuda\bin`, оттуда его подхватывает
 `engine.setup_cuda_dll_paths()`. Удалить — кнопка «Удалить» в настройках или
 просто снести папку.
 
@@ -125,7 +155,7 @@ powershell -ExecutionPolicy Bypass -File packaging\run-sandbox.ps1
 Если что-то не поднялось, диагностику даёт второй exe из той же папки:
 
 ```powershell
-iwhisper-selftest.exe --audio --model
+saytype-selftest.exe --audio --model
 ```
 
 Он консольный и проверяет импорты по одному — в отличие от оконного
@@ -141,18 +171,18 @@ iwhisper-selftest.exe --audio --model
 powershell -ExecutionPolicy Bypass -File release.ps1 -Version 0.1.0
 ```
 
-Скрипт проставляет версию в `src/iwhisper/__init__.py`, собирает PyInstaller и
+Скрипт проставляет версию в `src/saytype/__init__.py`, собирает PyInstaller и
 пакует релиз через Velopack в папку `Releases`: `Setup.exe` (установщик без прав
-администратора, ставит в `%LocalAppData%\iwhisper`), полный `.nupkg` и, начиная
+администратора, ставит в `%LocalAppData%\saytype`), полный `.nupkg` и, начиная
 со второй версии, delta-пакет.
 
 Что получается на выходе (замер 0.1.0 → 0.1.1, менялась одна строка версии):
 
 | Файл | Размер |
 |---|---|
-| `iwhisper-app-win-Setup.exe` | 198 МБ |
-| `iwhisper-app-0.1.1-full.nupkg` | 194 МБ |
-| `iwhisper-app-0.1.1-delta.nupkg` | **0.5 МБ** |
+| `saytype-app-win-Setup.exe` | 198 МБ |
+| `saytype-app-0.1.1-full.nupkg` | 194 МБ |
+| `saytype-app-0.1.1-delta.nupkg` | **0.5 МБ** |
 
 Ради delta всё и затевалось: обновление кода не тянет за собой перекачку Qt,
 CTranslate2 и остальных двух сотен мегабайт, которые не изменились.
@@ -162,25 +192,25 @@ CTranslate2 и остальных двух сотен мегабайт, кото
 так же, как из сети.
 
 ```powershell
-$env:IWHISPER_UPDATE_FEED = "C:\...\iwhisper\Releases"   # проверка цикла локально
+$env:SAYTYPE_UPDATE_FEED = "C:\...\saytype\Releases"   # проверка цикла локально
 ```
 
 Один раз понадобится `dotnet tool install -g vpk`. Версия CLI `vpk` и версия
 pip-пакета `velopack` обязаны совпадать: расхождение проявляется не на сборке, а
 на применении обновления.
 
-### Почему packId — `iwhisper-app`, а не `iwhisper`
+### Почему packId — `saytype-app`, а не `saytype`
 
 Velopack ставит приложение в `%LocalAppData%\<packId>`, и это не настраивается.
-Папка `%LocalAppData%\iwhisper` уже занята профилем пользователя: настройки,
+Папка `%LocalAppData%\saytype` уже занята профилем пользователя: настройки,
 словарь, скачанные веса моделей, CUDA-слой. Совпади имена — установщик у любого,
 кто уже пользовался приложением, упирается в диалог «папка существует,
 перезаписать?», а согласие стирает гигабайты скачанного; деинсталляция снесла бы
-профиль вместе с программой. Поэтому установка живёт в `iwhisper-app`, данные —
-в `iwhisper`, и обновление, заменяющее папку `current`, до данных не дотягивается.
+профиль вместе с программой. Поэтому установка живёт в `saytype-app`, данные —
+в `saytype`, и обновление, заменяющее папку `current`, до данных не дотягивается.
 
 Отображаемое имя задаётся `--packTitle`, так что в меню «Пуск» и в «Установке и
-удалении программ» видно «iWhisper».
+удалении программ» видно «SayType».
 
 ## Известные грабли
 
@@ -190,7 +220,7 @@ Velopack ставит приложение в `%LocalAppData%\<packId>`, и эт
   запись созвона целиком. Поймано самопроверкой, а не глазами.
 - **`MERGE()` для второго exe не годится.** Он назначает каждому общему модулю
   одного владельца, и самопроверка остаётся без `pyperclip`, PySide6 и пакета
-  `iwhisper` — начинает «находить» поломки, которых в приложении нет. Дублировать
+  `saytype` — начинает «находить» поломки, которых в приложении нет. Дублировать
   байткод дешевле, чем разбирать такие ложные срабатывания.
 - **`.ps1` с кириллицей нужен UTF-8 с BOM.** Windows PowerShell 5.1 читает скрипт
   без BOM как ANSI, и русский комментарий превращается в мусор, который парсер
@@ -211,8 +241,8 @@ Velopack ставит приложение в `%LocalAppData%\<packId>`, и эт
   добавляются в spec явно (`collect_dynamic_libs`).
 - **Вторая копия не запустится.** Приложение держит именованный мьютекс, поэтому
   собранная версия рядом с рабочей (запущенной из исходников) молча покажет
-  «iWhisper уже запущен» и выйдет. Для проверки сборки рабочую копию надо
+  «SayType уже запущен» и выйдет. Для проверки сборки рабочую копию надо
   закрыть через трей.
 - **`sys.frozen`.** Три места ведут себя по-разному в собранном виде: ярлык
-  автозапуска (цель — exe, а не `pythonw -m iwhisper`), отчёт об аварии (улика —
+  автозапуска (цель — exe, а не `pythonw -m saytype`), отчёт об аварии (улика —
   сам exe, исходников на диске нет) и splash-иконка (берётся из `sys._MEIPASS`).

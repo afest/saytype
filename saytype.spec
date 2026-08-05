@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Сборка iwhisper в папку с exe, запускаемую без Python (T-261).
+"""Сборка saytype в папку с exe, запускаемую без Python (T-261).
 
-    pyinstaller iwhisper.spec
+    pyinstaller saytype.spec
 
 Режим --onedir, не --onefile. Причины две: onefile распаковывает сотни мегабайт
 во временную папку при КАЖДОМ запуске (для приложения, живущего в трее, это
@@ -14,6 +14,11 @@
   * веса модели — качаются при первом использовании (engine.ensure_downloaded).
   * ffmpeg — только для опционального MP3-архива созвона; готовые сборки под GPL,
     бандлинг утянул бы весь проект в GPL. Без него сохраняется WAV.
+  * PyAV (T-318) — его колёса несут собственный FFmpeg, а в нём libx264 и
+    libx265 под GPLv2+. Приложение декодированием файлов не занимается, поэтому
+    пакет исключён, а импорт закрыт заглушкой (packaging/av_stub_rthook.py).
+  * pynput (T-318) — LGPL-3.0, использовался ради разбора одной строки. Разбор
+    переписан свой (src/saytype/hotkeys.py), зависимости больше нет.
 """
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
@@ -36,12 +41,22 @@ binaries += collect_dynamic_libs("ctranslate2")
 
 # 3. Иконка приложения: остальные иконки трея генерируются кодом в профиле
 #    пользователя, а .ico нужен ещё до этого — для splash и для самого exe.
-datas += [("assets/iwhisper.ico", "assets")]
+datas += [("assets/saytype.ico", "assets")]
+
+# 4. Тексты лицензий (T-318). Кладутся именно через `datas`, а не «лежат в
+#    репозитории»: обязательство LGPL-3.0 касается того, что человек получил на
+#    руки, а до репозитория он может и не дойти. Собственная MIT-лицензия
+#    приложения — рядом, чтобы состав поставки читался целиком.
+datas += [
+    ("LICENSE", "licenses"),
+    ("NOTICE.md", "licenses"),
+    ("licenses/LICENSE.LGPLv3", "licenses"),   # PySide6 / Qt
+    ("licenses/LICENSE.LGPLv2.1", "licenses"), # FFmpeg внутри Qt Multimedia
+    ("licenses/LICENSE.GPLv3", "licenses"),    # LGPL-3.0 ссылается на него
+    ("licenses/THIRD-PARTY-LICENSES.txt", "licenses"),
+]
 
 hiddenimports = [
-    # pynput выбирает платформенный бэкенд через __import__ по имени ОС
-    "pynput.keyboard._win32",
-    "pynput.mouse._win32",
     # sounddevice грузит PortAudio через cffi-обвязку
     "_cffi_backend",
     # faster-whisper зовёт их лениво, внутри функций
@@ -51,6 +66,14 @@ hiddenimports = [
 ]
 
 excludes = [
+    # --- Лицензионно несовместимое (T-318).
+    # `av`: колёса PyAV везут свою сборку FFmpeg с libx264/libx265 (GPLv2+).
+    # Компонент под GPL в поставке распространяет GPL на всю поставку, и MIT
+    # приложения этого не отменяет. Импорт закрывает заглушка из runtime-хука —
+    # `faster_whisper/audio.py` делает `import av` на уровне модуля, поэтому
+    # одного исключения мало: без заглушки падает импорт faster-whisper целиком.
+    # `pynput`: LGPL-3.0, брали ради разбора строки хоткея. Разбор теперь свой.
+    "av", "pynput",
     # --- Qt: берём только то, что реально импортируется (QtCore/Gui/Widgets/
     # Multimedia/Charts). Остальное — сотни мегабайт, из них один
     # Qt6WebEngineCore.dll весит 195 МБ.
@@ -97,14 +120,14 @@ excludes = [
 ]
 
 a = Analysis(
-    ["packaging/iwhisper_launch.py"],
+    ["packaging/saytype_launch.py"],
     pathex=["src"],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["packaging/av_stub_rthook.py"],
     excludes=excludes,
     noarchive=False,
     optimize=0,
@@ -117,10 +140,10 @@ a = Analysis(
 #
 # MERGE() здесь НЕ используется, хотя напрашивается: он раскладывает общие
 # модули по одному владельцу, и второй exe остаётся без pyperclip, PySide6 и
-# самого пакета iwhisper — то есть самопроверка начинает «находить» поломки,
+# самого пакета saytype — то есть самопроверка начинает «находить» поломки,
 # которых в приложении нет. Дублирование байткода дешевле такого вранья.
 a_selftest = Analysis(
-    ["packaging/iwhisper_selftest.py"],
+    ["packaging/saytype_selftest.py"],
     pathex=["src"],
     binaries=binaries,
     datas=datas,
@@ -129,11 +152,14 @@ a_selftest = Analysis(
     # своего runtime-хука, и `QtWidgets` падает с «DLL load failed» там, где у
     # приложения всё в порядке.
     hiddenimports=hiddenimports + [
-        "pyaudiowpatch", "pyperclip", "iwhisper.transcribe_call",
+        "pyaudiowpatch", "pyperclip", "saytype.transcribe_call", "saytype.hotkeys",
         "PySide6.QtWidgets", "PySide6.QtMultimedia", "PySide6.QtCharts",
         "scipy.signal", "PIL.Image",
     ],
     excludes=excludes,
+    # Тот же хук: самопроверка импортирует faster-whisper, а он на уровне модуля
+    # тянет `av`. Без заглушки она «нашла» бы поломку, которой в приложении нет.
+    runtime_hooks=["packaging/av_stub_rthook.py"],
     noarchive=False,
     optimize=0,
 )
@@ -146,7 +172,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="iwhisper",
+    name="saytype",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -159,7 +185,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="assets/iwhisper.ico",
+    icon="assets/saytype.ico",
 )
 
 exe_selftest = EXE(
@@ -167,12 +193,12 @@ exe_selftest = EXE(
     a_selftest.scripts,
     [],
     exclude_binaries=True,
-    name="iwhisper-selftest",
+    name="saytype-selftest",
     debug=False,
     strip=False,
     upx=False,
     console=True,  # тут вывод и есть смысл программы
-    icon="assets/iwhisper.ico",
+    icon="assets/saytype.ico",
 )
 
 coll = COLLECT(
@@ -185,5 +211,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="iwhisper",
+    name="saytype",
 )

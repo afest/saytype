@@ -5,9 +5,9 @@
 Qt-плагина, оно просто не появляется, без единой строки на экране. Здесь всё
 то же самое импортируется по очереди и печатается человеческим языком.
 
-    iwhisper-selftest.exe            проверить окружение и импорты
-    iwhisper-selftest.exe --audio    плюс список аудиоустройств
-    iwhisper-selftest.exe --model    плюс загрузка модели и транскрипция тишины
+    saytype-selftest.exe            проверить окружение и импорты
+    saytype-selftest.exe --audio    плюс список аудиоустройств
+    saytype-selftest.exe --model    плюс загрузка модели и транскрипция тишины
 
 Код возврата: 0 — всё поднялось, 1 — что-то не импортировалось.
 """
@@ -22,24 +22,26 @@ CHECKS = [
     ("PIL (иконки трея)", "PIL.Image"),
     ("sounddevice (микрофон)", "sounddevice"),
     ("pyaudiowpatch (WASAPI loopback)", "pyaudiowpatch"),
-    ("pynput (разбор hotkey)", "pynput.keyboard"),
+    ("saytype.hotkeys (разбор hotkey)", "saytype.hotkeys"),
     ("pyperclip (автопаст)", "pyperclip"),
     ("PySide6.QtWidgets", "PySide6.QtWidgets"),
     ("PySide6.QtMultimedia (плеер)", "PySide6.QtMultimedia"),
     ("PySide6.QtCharts (статистика)", "PySide6.QtCharts"),
-    ("av (нужен faster_whisper)", "av"),
+    # `av` в сборке подменён заглушкой (T-318): проверяем, что импорт проходит —
+    # именно он нужен faster_whisper. Настоящего PyAV с GPL-кодеками тут нет.
+    ("av (заглушка вместо PyAV)", "av"),
     ("onnxruntime (VAD)", "onnxruntime"),
     ("ctranslate2", "ctranslate2"),
     ("faster_whisper", "faster_whisper"),
     ("huggingface_hub", "huggingface_hub"),
-    ("iwhisper.engine", "iwhisper.engine"),
-    ("iwhisper.cuda_layer", "iwhisper.cuda_layer"),
-    ("iwhisper.transcribe_call", "iwhisper.transcribe_call"),
+    ("saytype.engine", "saytype.engine"),
+    ("saytype.cuda_layer", "saytype.cuda_layer"),
+    ("saytype.transcribe_call", "saytype.transcribe_call"),
 ]
 
 
 def main() -> int:
-    print("=== iwhisper: самопроверка сборки ===")
+    print("=== saytype: самопроверка сборки ===")
     print(f"frozen: {getattr(sys, 'frozen', False)}")
     print(f"exe:    {sys.executable}")
     print(f"python: {sys.version.split()[0]}")
@@ -57,7 +59,7 @@ def main() -> int:
         print(f"  ок      {title}  ({time.monotonic() - started:.1f}s)")
 
     print()
-    from iwhisper import cuda_layer, engine, profile
+    from saytype import cuda_layer, engine, profile
 
     print(f"профиль:        {profile.profile_dir()}")
     print(f"CUDA DLL-пути:  {[str(p) for p in engine.CUDA_DLL_DIRS] or 'нет'}")

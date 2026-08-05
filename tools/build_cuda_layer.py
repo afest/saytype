@@ -11,8 +11,8 @@ zip и печатает SHA-256 с размером — их надо пропи
 
 Проверить слой, не выкладывая ничего в сеть:
 
-    set IWHISPER_CUDA_LAYER_URL=file:///C:/.../dist/iwhisper-cuda-....zip
-    set IWHISPER_CUDA_LAYER_SHA256=<из вывода скрипта>
+    set SAYTYPE_CUDA_LAYER_URL=file:///C:/.../dist/saytype-cuda-....zip
+    set SAYTYPE_CUDA_LAYER_SHA256=<из вывода скрипта>
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from iwhisper import cuda_layer  # noqa: E402
+from saytype import cuda_layer  # noqa: E402
 
 
 def nvidia_bin_dirs() -> list[Path]:
@@ -95,7 +95,7 @@ def main() -> int:
 
     print(f"\nГотово: {out_path}  ({size / 1e6:.0f} МБ)")
     print(f"SHA-256: {digest}")
-    print("\nВпишите в src/iwhisper/cuda_layer.py:")
+    print("\nВпишите в src/saytype/cuda_layer.py:")
     print(f'    LAYER_SHA256 = "{digest}"')
     print(f"    LAYER_SIZE_BYTES = {size}")
     return 0

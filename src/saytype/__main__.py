@@ -1,4 +1,4 @@
-"""Точка входа: ``pythonw.exe -m iwhisper``.
+"""Точка входа: ``pythonw.exe -m saytype``.
 
 Тяжёлая часть — в ``transcribe_ui``: там на module-level сидит защита от второй
 копии и splash, которые обязаны отработать ДО импорта PySide6 и faster-whisper.
