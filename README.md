@@ -80,10 +80,20 @@ What you can check instead of trusting the sentence above:
 
 ## VirusTotal
 
-Every release is scanned and the report is linked from the release notes on the
-[Releases page](https://github.com/afest/saytype/releases). Open the report for
-the version you downloaded rather than trusting a link here: a report belongs to
-one exact file, and a link that outlives its file is worse than none.
+A VirusTotal report belongs to one exact file, so the link is built from that
+file's hash. For the current release:
+
+| File | SHA-256 | Report |
+|---|---|---|
+| `saytype-app-win-Setup.exe` | `9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380` | [VirusTotal](https://www.virustotal.com/gui/file/9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380) |
+| `saytype-app-win-Portable.zip` | `ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e` | [VirusTotal](https://www.virustotal.com/gui/file/ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e) |
+
+Check the hash of what you downloaded before trusting the report — that is what
+ties the two together:
+
+```powershell
+Get-FileHash .\saytype-app-win-Setup.exe -Algorithm SHA256
+```
 
 A handful of engines out of seventy flagging a generic heuristic is the normal
 result for an unsigned PyInstaller build — see below for why.
