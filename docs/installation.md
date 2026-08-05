@@ -1,5 +1,10 @@
 # Installation (Windows)
 
+> **Just want to use it?** Download the installer from the
+> [latest release](https://github.com/afest/saytype/releases/latest) — it brings
+> its own Python and needs no administrator rights. This page is for running from
+> source: developing, changing the code, or building your own distribution.
+
 ## 1. Python
 
 Python 3.10 or newer, 3.12 recommended. Install it **for the current user**, not
