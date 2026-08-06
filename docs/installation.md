@@ -1,27 +1,28 @@
-# Installation (Windows)
+> 🇬🇧 [English version](installation.en.md)
 
-> **Just want to use it?** Download the installer from the
-> [latest release](https://github.com/afest/saytype/releases/latest) — it brings
-> its own Python and needs no administrator rights. This page is for running from
-> source: developing, changing the code, or building your own distribution.
+# Установка из исходников (Windows)
+
+> **Просто хотите пользоваться?** Скачайте установщик из
+> [последнего релиза](https://github.com/afest/saytype/releases/latest) — он
+> несёт свой Python и не просит прав администратора. Эта страница про запуск из
+> исходников: разработку, правку кода и сборку своего дистрибутива.
 
 ## 1. Python
 
-Python 3.10 or newer, 3.12 recommended. Install it **for the current user**, not
-system-wide, unless you have a reason — the rest of these instructions use
+Python 3.10 или новее, лучше 3.12. Ставьте **для текущего пользователя**, а не на
+всю систему, если нет причин делать иначе, — дальше везде используется
 `pip install --user`.
 
-Check that the interpreter you are about to use is the one you think it is:
+Убедитесь, что интерпретатор именно тот, о котором вы думаете:
 
 ```powershell
 python -c "import sys; print(sys.executable, sys.version)"
 ```
 
-If several Pythons are installed, call the intended one by its full path
-everywhere below. A smoke test that "passes" on the wrong interpreter is worse
-than no smoke test.
+Если Python'ов несколько, вызывайте нужный полным путём во всех командах ниже.
+Смоук-тест, который «прошёл» на чужом интерпретаторе, хуже, чем его отсутствие.
 
-## 2. The package
+## 2. Пакет
 
 ```powershell
 git clone https://github.com/afest/saytype
@@ -30,72 +31,80 @@ pip install --user -r requirements.txt
 pip install --user -e .
 ```
 
-`-e` (editable) means the repository *is* the installed code: edit a file,
-restart the app, and the change is live. Drop the `-e` for a snapshot install.
+`-e` (editable) означает, что репозиторий *и есть* установленный код: правите
+файл, перезапускаете приложение — правка уже работает. Уберите `-e`, если нужна
+установка снимком.
 
-## 3. GPU
+## 3. Видеокарта
 
-Nothing to do if you already have a working CUDA 12.x runtime. If CTranslate2
-cannot find `cublas` / `cudnn`, install them from pip:
+Ничего делать не нужно, если рабочий CUDA-рантайм 12.x уже стоит. Если
+CTranslate2 не находит `cublas` / `cudnn`, поставьте их из pip:
 
 ```powershell
 pip install --user nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-These land in `site-packages\nvidia\*\bin`, where the Windows DLL search does not
-look — `saytype.engine` adds those folders to the search path at import, before
-anything touches `ctranslate2`. That is why importing `engine` first matters.
+Они окажутся в `site-packages\nvidia\*\bin`, куда поиск DLL в Windows не
+заглядывает: `saytype.engine` добавляет эти папки в путь поиска при импорте, до
+того как что-либо коснётся `ctranslate2`. Поэтому и важно, чтобы `engine`
+импортировался первым.
 
-Verify:
+Проверка:
 
 ```powershell
 python -c "from saytype import engine; m = engine.load_model('tiny'); print(engine.current_device(), engine.current_compute_type())"
 ```
 
-`cuda float16` (or another `cuda` compute type) means the GPU path works. `cpu
-int8` means it fell back — check `nvidia-smi` and the driver version. It still
-works, just slower.
+`cuda float16` (или другой тип вычислений с `cuda`) — путь через видеокарту
+работает. `cpu int8` — произошёл откат: посмотрите `nvidia-smi` и версию
+драйвера. Работать будет и так, просто медленнее.
 
-## 4. First run
+## 4. Первый запуск
 
 ```powershell
 pythonw.exe -m saytype
 ```
 
-The first start downloads model weights (0.5–2 GB depending on the preset) with a
-progress dialog, and generates the tray icons. Both go to
+При первом старте скачиваются веса модели (0.5–2 ГБ в зависимости от выбранной) с
+окном прогресса и рисуются значки трея. И то, и другое кладётся в
 `%LOCALAPPDATA%\saytype`.
 
-If nothing appears: run `python -m saytype` (without the `w`) to get the log in
-the console.
+Если ничего не появилось — запустите `python -m saytype` (без `w`), чтобы увидеть
+лог в консоли.
 
-## 5. Optional
+## 5. По желанию
 
-**ffmpeg** — only for the MP3 archive of recorded calls:
+**ffmpeg** — нужен только для MP3-архива записанных созвонов:
 
 ```powershell
 winget install Gyan.FFmpeg
 ```
 
-The app looks for `ffmpeg` in `PATH` and in the winget package folder. Without it
-the call WAV is kept and nothing fails.
+Приложение ищет `ffmpeg` в `PATH` и в папке пакета winget. Без него остаётся WAV
+созвона, и ничего не ломается.
 
-**Autostart** — a checkbox in Settings. It creates a shortcut to
-`pythonw.exe -m saytype` in `shell:startup`.
+**Автозапуск** — галочка в настройках. Она создаёт ярлык на
+`pythonw.exe -m saytype` в `shell:startup`.
 
-## Upgrading from an unpackaged copy
+## Переход со старой, несобранной копии
 
-If you ran the modules as loose files before, settings used to live in
-`%APPDATA%\faster-whisper-ui\settings.ini`. On first start the app copies that
-file into `%LOCALAPPDATA%\saytype\settings.ini` — a copy, not a move, so the old
-one stays as a fallback. The history folder is taken from the settings, so
-recordings stay where they were.
+Если раньше вы запускали модули отдельными файлами, настройки лежали в
+`%APPDATA%\faster-whisper-ui\settings.ini`. При первом старте приложение копирует
+этот файл в `%LOCALAPPDATA%\saytype\settings.ini` — именно копирует, не
+перемещает, так что старый остаётся как путь отката. Папка истории берётся из
+настроек, поэтому записи остаются там же, где были.
 
-## Uninstall
+Если вы пользовались версией под прежним именем, папка данных
+`%LOCALAPPDATA%\iwhisper` переименовывается в `%LOCALAPPDATA%\saytype` при первом
+запуске. Переименование, а не копирование: веса моделей весят гигабайты. Если
+переименовать не удалось (файл занят), приложение продолжит работать со старой
+папкой и попробует снова при следующем запуске.
+
+## Удаление
 
 ```powershell
 pip uninstall saytype
 ```
 
-Then delete `%LOCALAPPDATA%\saytype` (settings, dictionary, model weights,
-history) and the autostart shortcut from `shell:startup` if you created one.
+Потом удалите `%LOCALAPPDATA%\saytype` (настройки, словарь, веса моделей,
+история) и ярлык автозапуска из `shell:startup`, если создавали.

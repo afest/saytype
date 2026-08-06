@@ -1,126 +1,142 @@
+> 🇬🇧 [English version](README.en.md)
+
 # SayType
 
-**Dictation for Windows that types into any window.** Press a hotkey, talk, press
-it again — the text lands where your cursor was. Speech recognition runs on your
-own machine, on your GPU if you have one.
+**Диктовка для Windows, которая печатает в любое окно.** Нажали сочетание клавиш,
+наговорили, нажали ещё раз — текст оказывается там, где стоял курсор. Речь
+распознаётся на вашем компьютере, на видеокарте, если она есть.
 
-### [⬇ Download SayType for Windows](https://github.com/afest/saytype/releases/latest/download/saytype-app-win-Setup.exe)
+### [⬇ Скачать SayType для Windows](https://github.com/afest/saytype/releases/latest/download/saytype-app-win-Setup.exe)
 
-1. Run the installer. It installs for the current user and does not ask for
-   administrator rights. Windows will warn you about an unsigned app —
-   [what to click](#windows-says-the-app-is-not-signed).
-2. A first-run wizard asks for your microphone, a hotkey and a model, then
-   downloads the model (0.5–2 GB, once).
-3. Press the hotkey anywhere, say something, press it again. The text is pasted
-   into the window you were in.
+1. Запустите установщик. Ставится в профиль пользователя, права администратора не
+   нужны. Windows предупредит, что приложение без подписи —
+   [что нажимать](#windows-says-the-app-is-not-signed).
+2. Мастер первого запуска спросит микрофон, сочетание клавиш и модель, потом
+   скачает саму модель (0.5–2 ГБ, один раз).
+3. Нажмите сочетание в любом окне, скажите фразу, нажмите ещё раз. Текст
+   вставится туда, где вы были.
 
-Prefer to run it from source? See [For developers](#for-developers) below.
+Хотите запускать из исходников — смотрите [Для разработчиков](#for-developers).
 
-It also records calls: your microphone and the system output are captured as two
-separate channels, so the transcript comes out with speakers already separated.
+Приложение умеет ещё и записывать созвоны: микрофон и звук системы пишутся двумя
+отдельными каналами, поэтому в транскрипте реплики уже разделены по говорящим.
 
-> **Status:** works, used daily by its author, but rough around the edges. The
-> interface is currently in Russian only; this README and the documentation are
-> in English.
+> **Состояние:** работает, автор пользуется им каждый день, но углы не сглажены.
+> Интерфейс пока только на русском.
 
-## What leaves your machine
+<a id="what-leaves-your-machine"></a>
 
-Speech never does — recognition is local, there is no account and no telemetry.
-Three things do reach the network, all of them either optional or one-time:
+## Что уходит с вашего компьютера
 
-| When | Where to | What for |
+Речь — никогда. Распознавание идёт локально, аккаунта нет, телеметрии нет. В сеть
+приложение ходит трижды, и каждый раз это либо разовое, либо необязательное:
+
+| Когда | Куда | Зачем |
 |---|---|---|
-| First use of a model | `huggingface.co` | downloading the model weights |
-| You click "GPU acceleration" | `github.com` (this repository's releases) | downloading the NVIDIA CUDA runtime |
-| On start and from Settings | `github.com` (this repository's releases) | checking for a new version |
+| При первом использовании модели | `huggingface.co` | скачать веса модели |
+| При нажатии «Ускорение GPU» | `github.com`, релизы этого репозитория | скачать CUDA-библиотеки NVIDIA |
+| При запуске и по кнопке в настройках | `github.com`, релизы этого репозитория | проверить, вышла ли новая версия |
 
-Recordings, transcripts, your dictionary and your settings stay in
-`%LOCALAPPDATA%\saytype` and are never uploaded anywhere.
+Записи, транскрипты, ваш словарь и настройки лежат в `%LOCALAPPDATA%\saytype` и
+никуда не отправляются.
 
-## Why
+## Зачем это, если есть другие
 
-CPU-only dictation tools are fast enough to be usable and slow enough to be
-annoying. If you already own an NVIDIA card, the same audio goes through
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper) several times faster
-at comparable accuracy. Measured against a CPU Parakeet-based tool on the same
-recordings: **2.2–2.8× faster, error rate within noise of each other**. On a
-60-second dictation the full pass runs around 9–10× realtime.
+Диктовка на процессоре работает достаточно быстро, чтобы ею пользоваться, и
+достаточно медленно, чтобы раздражать. Если у вас уже стоит карта NVIDIA, то же
+самое аудио проходит через [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+в разы быстрее при сопоставимой точности. Замер против решения на процессоре
+(Parakeet) на одних и тех же записях: **быстрее в 2.2–2.8 раза, разница в ошибках
+в пределах шума**. Минутная надиктовка обрабатывается примерно за шестую часть
+своей длительности.
 
-Numbers are from one machine (GTX 1060, 6 GB) and one speaker, in Russian. Treat
-them as an order of magnitude, not a benchmark.
+Цифры сняты на одной машине (GTX 1060, 6 ГБ) и одном голосе, на русском.
+Это порядок величины, а не бенчмарк.
 
-## Requirements
+<a id="requirements"></a>
 
-- Windows 10 or 11.
-- NVIDIA GPU with CUDA 12.x for the fast path. **Without one it still works** —
-  CTranslate2 falls back to CPU int8 automatically, just slower; pick a smaller
-  model in that case.
-- ~0.5–2 GB of disk for model weights, downloaded on first run.
-- Optional: `ffmpeg` in `PATH`, only if you want an MP3 archive of recorded
-  calls. Without it the WAV is kept and nothing fails.
+## Что нужно
 
-The installer brings its own Python — you do not need one installed.
+- Windows 10 или 11.
+- Видеокарта NVIDIA с CUDA 12.x — для быстрого режима. **Без неё тоже работает:**
+  CTranslate2 сам переключается на процессор (int8), просто медленнее; в этом
+  случае берите модель поменьше.
+- 0.5–2 ГБ на диске под веса модели, скачиваются при первом запуске.
+- По желанию — `ffmpeg` в `PATH`, только если нужен MP3-архив записанного
+  созвона. Без него остаётся WAV, ничего не ломается.
+
+Python ставить не нужно, установщик несёт свой.
+
+<a id="windows-says-the-app-is-not-signed"></a>
 
 ## Windows says the app is not signed
 
-On first run Windows shows a blue **"Windows protected your PC"** screen. Click
-**More info**, then **Run anyway**.
+*(Windows пишет, что приложение без подписи)*
 
-This happens because the installer is not signed with a code-signing
-certificate. Such a certificate costs a few hundred dollars a year, and this is a
-free tool with no company behind it, so there is none. The warning is about the
-absence of a signature, not about the contents of the file.
+При первом запуске Windows покажет синий экран **«Система Windows защитила ваш
+компьютер»**. Нажмите **«Подробнее»**, затем **«Выполнить в любом случае»**.
 
-What you can check instead of trusting the sentence above:
+Так происходит потому, что установщик не подписан сертификатом разработчика.
+Такой сертификат стоит несколько сотен долларов в год, а это бесплатный
+инструмент без компании за спиной — сертификата нет. Предупреждение говорит об
+отсутствии подписи, а не о содержимом файла.
 
-- the [VirusTotal report](#virustotal) for this exact release;
-- the source in this repository, and the build recipe in
-  [`docs/build.md`](docs/build.md) — the release is built from it with one
-  command, so you can produce your own binary and compare behaviour.
+Что можно проверить вместо того, чтобы верить предыдущему абзацу:
+
+- [отчёт VirusTotal](#virustotal) именно по этому релизу;
+- исходный код в этом репозитории и рецепт сборки в
+  [`docs/build.md`](docs/build.md) — релиз собирается из него одной командой, так
+  что вы можете собрать свой бинарник и сравнить поведение.
+
+<a id="virustotal"></a>
 
 ## VirusTotal
 
-A VirusTotal report belongs to one exact file, so the link is built from that
-file's hash. For the current release:
+Отчёт VirusTotal привязан к одному конкретному файлу, поэтому ссылка строится из
+его хеша. Для текущего релиза:
 
-| File | SHA-256 | Report |
+| Файл | SHA-256 | Отчёт |
 |---|---|---|
 | `saytype-app-win-Setup.exe` | `9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380` | [VirusTotal](https://www.virustotal.com/gui/file/9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380) |
 | `saytype-app-win-Portable.zip` | `ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e` | [VirusTotal](https://www.virustotal.com/gui/file/ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e) |
 
-Check the hash of what you downloaded before trusting the report — that is what
-ties the two together:
+Прежде чем доверять отчёту, сверьте хеш того, что скачали, — именно он связывает
+одно с другим:
 
 ```powershell
 Get-FileHash .\saytype-app-win-Setup.exe -Algorithm SHA256
 ```
 
-A handful of engines out of seventy flagging a generic heuristic is the normal
-result for an unsigned PyInstaller build — see below for why.
+Когда пара движков из семидесяти показывает общую эвристику — это обычный
+результат для неподписанной сборки PyInstaller. Почему так, читайте ниже.
 
-## Antivirus warnings
+<a id="antivirus-warnings"></a>
 
-Some antivirus engines flag the app, usually as a generic "may be a keylogger"
-heuristic. That reaction is expected and comes from what a dictation tool has to
-do to work at all:
+## Что скажет антивирус
 
-- it registers a **global hotkey**, so it must be reachable while you are in
-  another application;
-- it **sends a synthetic Ctrl+V** to paste the result into the window you were
-  in;
-- it **records the microphone**, and for call recording also the system output.
+Часть антивирусов пометит приложение, обычно общей эвристикой в духе «возможно,
+кейлоггер». Реакция ожидаемая и следует из того, что инструмент диктовки обязан
+делать, чтобы вообще работать:
 
-Any of the three, on its own, is enough for a heuristic. What the app does *not*
-do: it does not log keystrokes (a hotkey registration is not a keyboard hook),
-does not run in the background without the tray icon, does not send audio or text
-anywhere, and does not phone home. The three network destinations are listed
-above in [What leaves your machine](#what-leaves-your-machine) — you can verify
-them with a firewall or a proxy.
+- он регистрирует **глобальное сочетание клавиш** — иначе до него не дотянуться,
+  пока вы в другом приложении;
+- он **посылает синтетический Ctrl+V**, чтобы вставить результат в то окно, где
+  вы были;
+- он **пишет микрофон**, а для записи созвона ещё и звук системы.
 
-If your antivirus quarantines the app, the honest options are to check the
-VirusTotal report, to add an exclusion, or to build it yourself from source.
+Любого из трёх пунктов по отдельности хватает, чтобы эвристика сработала. Чего
+приложение **не** делает: не ведёт журнал нажатий (регистрация сочетания клавиш —
+это не перехват клавиатуры), не работает в фоне без значка в трее, не отправляет
+никуда ни звук, ни текст и не звонит домой. Все три сетевых адреса перечислены
+выше, в разделе [Что уходит с вашего компьютера](#what-leaves-your-machine), —
+их можно проверить фаерволом или прокси.
 
-## For developers
+Если антивирус отправил приложение в карантин, честные варианты такие: посмотреть
+отчёт VirusTotal, добавить исключение или собрать приложение самому из исходников.
+
+<a id="for-developers"></a>
+
+## Для разработчиков
 
 ```powershell
 git clone https://github.com/afest/saytype
@@ -129,99 +145,103 @@ pip install --user -r requirements.txt
 pip install --user -e .
 ```
 
-If CTranslate2 cannot find `cublas` / `cudnn`, install the CUDA runtime from pip
-instead of a full toolkit:
+Если CTranslate2 не находит `cublas` / `cudnn`, поставьте CUDA-рантайм из pip
+вместо полного тулкита:
 
 ```powershell
 pip install --user "saytype[cuda]"
 ```
 
-Then run it:
+Запуск:
 
 ```powershell
-pythonw.exe -m saytype      # no console window
-python -m saytype           # same, but with a console for logs
+pythonw.exe -m saytype      # без окна консоли
+python -m saytype           # то же, но с консолью и логами
 ```
 
-Building the distribution is described in [`docs/build.md`](docs/build.md).
+Подробности установки из исходников — в [`docs/installation.md`](docs/installation.md),
+сборка дистрибутива — в [`docs/build.md`](docs/build.md). Архитектурные решения и
+причины, по которым код выглядит именно так, — в
+[`docs/architecture.md`](docs/architecture.md), **на английском**: файл написан
+для внешнего читателя, и термины стека в нём всё равно английские.
 
-## Using it
+## Как этим пользоваться
 
-The app lives in the tray. Double-click the tray icon for the history window;
-right-click for settings, "About" and exit.
+Приложение живёт в трее. Двойной клик по значку открывает окно с историей, правый
+клик — настройки, «О программе» и выход.
 
-| Action | Default |
+| Действие | По умолчанию |
 |---|---|
-| Dictate (hold-free toggle) | `Ctrl+Shift+Q` |
-| Record a call | `Ctrl+Shift+E` |
+| Диктовка (нажать — наговорить — нажать) | `Ctrl+Shift+Q` |
+| Запись созвона | `Ctrl+Shift+E` |
 
-The dictation hotkey is configurable in settings and applies immediately, without
-a restart.
+Сочетание для диктовки меняется в настройках и применяется сразу, без перезапуска.
 
-## Where your data lives
+## Где лежат ваши данные
 
-Everything is under `%LOCALAPPDATA%\saytype`:
+Всё внутри `%LOCALAPPDATA%\saytype`:
 
 ```
-settings.ini         application settings
-dictionary.txt       your vocabulary hint (see below)
-replacements.json    text replacement rules
-models/              downloaded model weights
-history/             recordings and transcripts (configurable)
-history/Calls/       call transcripts, audio buffer, recovery data
-runtime/             crash log and live-session marker
-icons/               tray icons, generated on first run
+settings.ini         настройки приложения
+dictionary.txt       ваш словарь-подсказка (см. ниже)
+replacements.json    правила замен в готовом тексте
+models/              скачанные веса моделей
+history/             записи и расшифровки (папка меняется в настройках)
+history/Calls/       транскрипты созвонов, буфер аудио, данные восстановления
+runtime/             журнал аварий и маркер живой сессии
+icons/               значки трея, рисуются при первом запуске
 ```
 
-No telemetry. The only outgoing connections are the three listed in
-[What leaves your machine](#what-leaves-your-machine).
+Телеметрии нет. Единственные исходящие соединения — те три, что перечислены в
+разделе [Что уходит с вашего компьютера](#what-leaves-your-machine).
 
-## Vocabulary and replacements
+## Словарь и замены
 
-Whisper mangles names, product names and jargon it has never seen. Two knobs,
-both empty out of the box, both in **Settings**:
+Whisper коверкает имена, названия и жаргон, которых не встречал. Две настройки,
+обе пустые из коробки, обе в **Настройках**:
 
-**Dictionary** — words, names and terms the model gets wrong. The text is passed
-to Whisper as `initial_prompt`: a hint, not a rule. Keep it dense — short forms
-and inflections, no prose. There is a hard limit of **223 tokens**, and anything
-over it is silently cut **from the beginning of the string**, which means your
-first entries quietly stop working. The counter under the field shows where you
-are.
+**Словарь** — слова, имена и термины, которые модель путает. Текст уходит в
+Whisper как `initial_prompt`, то есть это подсказка, а не правило. Держите его
+плотным: короткие формы и склонения, без связных предложений. Есть жёсткий предел
+в **223 токена**, и всё сверх него молча отрезается **с начала строки** — то есть
+первые записи тихо перестают работать. Счётчик под полем показывает, где вы.
 
-**Replacements in text** — `pattern → replacement` rules (Python regular
-expressions, group references work) applied to the finished text. Use these when
-the hint is not enough. A rule can be marked *end of text only*: useful against
-the endings Whisper hallucinates over trailing silence ("thanks for watching"),
-dangerous for call transcripts where a short closing line may be real.
+**Замены в тексте** — правила «шаблон → замена» (регулярные выражения Python,
+ссылки на группы работают), применяются к готовому тексту. Нужны там, где
+подсказки не хватило. Правило можно пометить как «только конец текста»: полезно
+против концовок, которые Whisper придумывает на тишине в конце записи («спасибо
+за просмотр»), и опасно для транскриптов созвонов, где короткая финальная реплика
+может быть настоящей.
 
-A filled-in example is in
+Заполненный пример —
 [`examples/dictionary-ru-example.json`](examples/dictionary-ru-example.json).
 
-## Recording calls
+## Запись созвонов
 
-`Ctrl+Shift+E` starts and stops. The microphone and the WASAPI loopback of your
-default playback device are recorded separately, then transcribed channel by
-channel and merged into one Markdown file with timestamps and speaker labels
-(the names are yours to set in Settings).
+`Ctrl+Shift+E` начинает и заканчивает. Микрофон и WASAPI-петля устройства вывода
+по умолчанию пишутся раздельно, потом расшифровываются канал за каналом и
+сливаются в один Markdown-файл с временными метками и именами говорящих (имена
+задаются в настройках).
 
-**Get consent before you record.** In many countries and US states recording a
-conversation without telling the other party is illegal. The app cannot know
-where you are and does not ask.
+**Предупредите собеседника о записи.** Во многих странах и штатах запись
+разговора без предупреждения второй стороны незаконна. Приложение не знает, где
+вы находитесь, и решить это за вас не может. Перед первой записью оно покажет то
+же предупреждение.
 
-Two things that will bite you:
+Две вещи, на которых спотыкаются:
 
-- The transcript only separates speakers if the other party's audio actually goes
-  through your **default** Windows playback device. If the call plays on a headset
-  while the default output is a monitor, the second channel records digital
-  silence. The app detects this and puts a warning banner in the transcript, but
-  the recording is already lost — check the output device first.
-- Audio is streamed to disk while recording, so a crash or a power loss costs the
-  last second or two, not the whole call. On the next start saytype offers to
-  finish an interrupted recording.
+- Говорящие разделятся только если звук собеседника действительно идёт через
+  устройство вывода, выбранное в Windows **по умолчанию**. Если созвон играет в
+  наушниках, а по умолчанию стоит монитор, второй канал запишет цифровую тишину.
+  Приложение это заметит и напишет предупреждение в транскрипт, но запись уже
+  потеряна — проверяйте устройство вывода заранее.
+- Аудио пишется на диск по ходу записи, поэтому авария или отключение питания
+  стоят последней секунды-двух, а не всего созвона. При следующем запуске
+  приложение предложит доделать прерванную запись.
 
-## Batch transcription
+## Расшифровка файлов из кода
 
-`saytype.engine` is standalone — no Qt, no UI:
+`saytype.engine` работает сам по себе — без Qt и без интерфейса:
 
 ```python
 from saytype import engine
@@ -231,69 +251,72 @@ segments, info = model.transcribe("call.wav", language="ru", beam_size=5)
 print(" ".join(s.text.strip() for s in segments))
 ```
 
-It owns CUDA DLL setup on Windows, model download with progress, the
-`compute_type` fallback chain (`float16 → int8_float16 → int8_float32 → float32
-→ cpu/int8`), and unloading from VRAM.
+На нём же лежит настройка путей к CUDA-библиотекам в Windows, скачивание модели с
+прогрессом, цепочка отката `compute_type` (`float16 → int8_float16 →
+int8_float32 → float32 → cpu/int8`) и выгрузка модели из видеопамяти.
 
-Passing a **file path**, as above, makes faster-whisper decode it through PyAV,
-which comes with the library in a normal Python environment. The packaged
-application does not ship PyAV (see [NOTICE.md](NOTICE.md)) and works with audio
-as NumPy arrays — that path is unaffected.
+Если передать **путь к файлу**, как выше, faster-whisper декодирует его через
+PyAV — он приезжает вместе с библиотекой в обычном окружении Python. В собранном
+приложении PyAV нет (почему — в [NOTICE.md](NOTICE.md)), оно работает с аудио как
+с массивами NumPy, и этот путь не задет.
 
-To rebuild a transcript from an already recorded call:
+Пересобрать транскрипт из уже записанного созвона:
 
 ```powershell
-python -m saytype.retranscribe_call            # newest WAV in the calls folder
+python -m saytype.retranscribe_call            # свежий WAV из папки созвонов
 python -m saytype.retranscribe_call "path.wav"
 ```
 
-## Models
+<a id="models"></a>
 
-Six presets from `tiny` to `large-v3`, plus "custom": any Hugging Face repo id or
-a local folder holding a CTranslate2 model. Weights are downloaded to
-`%LOCALAPPDATA%\saytype\models` with a progress dialog. Switching models at
-runtime unloads the old one from VRAM first; it is blocked while a recording or a
-transcription is in flight.
+## Модели
 
-Not every checkpoint works: the model must be in CTranslate2 format. A
-`.safetensors` Transformers model is rejected with the `ct2-transformers-converter`
-command you need to run.
+Шесть готовых вариантов от `tiny` до `large-v3` плюс «своя модель»: любой
+идентификатор репозитория Hugging Face или папка с моделью в формате CTranslate2.
+Веса скачиваются в `%LOCALAPPDATA%\saytype\models` с окном прогресса. Смена модели
+на ходу сначала выгружает старую из видеопамяти; во время записи или расшифровки
+смена заблокирована.
 
-## Known limitations
+Подойдёт не всякая модель: нужен формат CTranslate2. Модель Transformers в
+`.safetensors` приложение отклонит и покажет команду `ct2-transformers-converter`,
+которую надо выполнить.
 
-- **Windows only.** WASAPI loopback, `RegisterHotKey` and the paste path are all
-  Win32. The transcription core is portable, the app is not.
-- **Russian is the tuned path.** The language is passed explicitly as `ru` in the
-  dictation flow; other languages work but are not what the defaults were shaped
-  around.
-- **No installer.** Packaging and auto-update are the next step.
-- **Older GPUs** (Pascal and similar) work, but through compute types that are
-  not the fastest available. The fallback chain sorts it out automatically.
-- **The first run is slow** — 5–10 seconds of imports before the window appears,
-  plus the model download.
+## Чего ждать не стоит
 
-## License
+- **Только Windows.** WASAPI-петля, `RegisterHotKey` и способ вставки текста —
+  всё это Win32. Ядро распознавания переносимо, приложение — нет.
+- **Русский — основной язык.** В диктовке язык передаётся явно как `ru`; другие
+  языки работают, но настройки затачивались не под них.
+- **Установщик не подписан.** Windows и часть антивирусов об этом скажут — см.
+  два раздела выше.
+- **Старые видеокарты** (Pascal и подобные) работают, но через не самые быстрые
+  типы вычислений. Цепочка отката разбирается с этим сама.
+- **Первый запуск медленный** — 5–10 секунд на импорты до появления окна, плюс
+  скачивание модели.
 
-MIT — see [LICENSE](LICENSE). Third-party components and what changes when you
-bundle them are in [NOTICE.md](NOTICE.md).
+## Лицензия
 
-**LGPL components.** The user interface is built on **PySide6 / Qt 6.11.1**, used
-under the **LGPL-3.0**. Qt Multimedia additionally brings its own **FFmpeg
-n7.1.3** libraries, under the **LGPL-2.1-or-later** (Qt builds them without
-`--enable-gpl`, so no `libx264` / `libx265`). The build ships all of these as
-separate files next to the executable, not linked into it, so you can replace
-them with your own build of the same version. Sources for exactly those versions:
+MIT, файл [LICENSE](LICENSE). Сторонние компоненты и то, что меняется при их
+включении в сборку, — в [NOTICE.md](NOTICE.md) (на английском: это юридический
+текст в паре с англоязычными лицензиями, и второй версии у него быть не должно).
+
+**Компоненты под LGPL.** Интерфейс построен на **PySide6 / Qt 6.11.1** под
+**LGPL-3.0**. Qt Multimedia дополнительно приносит собственные библиотеки
+**FFmpeg n7.1.3** под **LGPL-2.1 или новее** (Qt собирает их без `--enable-gpl`,
+поэтому `libx264` и `libx265` там нет). Всё это едет в сборке отдельными файлами
+рядом с исполняемым, а не внутри него, — значит их можно заменить своей сборкой
+той же версии. Исходники именно этих версий:
 <https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/>
-and <https://github.com/FFmpeg/FFmpeg/releases/tag/n7.1.3>. The full license texts
-travel with the distribution in `licenses/`, and the same information is in the
-application under **Tray → About**.
+и <https://github.com/FFmpeg/FFmpeg/releases/tag/n7.1.3>. Полные тексты лицензий
+едут вместе с дистрибутивом в папке `licenses/`, то же самое есть в приложении:
+**трей → О программе**.
 
-Nothing under the GPL is redistributed. In particular PyAV is deliberately left
-out of builds: its wheels bundle an FFmpeg with `libx264` / `libx265`, which are
-GPLv2+, and a single such file would place the whole distribution under the GPL.
+Ничего под GPL не распространяется. В частности, PyAV сознательно исключён из
+сборок: его колёса несут FFmpeg с `libx264` и `libx265` под GPLv2+, и одного
+такого файла достаточно, чтобы под GPL попала вся поставка.
 
-**NVIDIA runtime.** The optional GPU layer contains NVIDIA's cuBLAS and cuDNN,
-redistributed under the CUDA EULA and the cuDNN SLA as a component of this
-application. *This software contains source code provided by NVIDIA Corporation.*
-The license texts are inside the archive and are unpacked next to the libraries.
-Details are in [NOTICE.md](NOTICE.md).
+**Библиотеки NVIDIA.** Необязательный GPU-слой содержит cuBLAS и cuDNN от NVIDIA,
+распространяемые по CUDA EULA и cuDNN SLA как часть этого приложения.
+*This software contains source code provided by NVIDIA Corporation.* Тексты
+лицензий лежат внутри архива и распаковываются рядом с библиотеками. Подробности
+— в [NOTICE.md](NOTICE.md).
