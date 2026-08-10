@@ -7,9 +7,10 @@
 it again — the text lands where your cursor was. Speech recognition runs on your
 own machine, on your GPU if you have one.
 
-### [⬇ Download SayType for Windows](https://github.com/afest/saytype/releases/latest/download/saytype-app-win-Setup.exe)
+### [⬇ Download SayType for Windows](https://github.com/afest/saytype/releases/latest)
 
-1. Run the installer. It installs for the current user and does not ask for
+1. On the release page open **Assets** and grab `saytype-app-win-Setup.exe`.
+   Run the installer: it installs for the current user and does not ask for
    administrator rights. Windows will warn you about an unsigned app —
    [what to click](#windows-says-the-app-is-not-signed).
 2. A first-run wizard asks for your microphone, a hotkey and a model, then
