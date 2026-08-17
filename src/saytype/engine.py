@@ -32,6 +32,7 @@ import site
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -171,6 +172,28 @@ ALLOW_PATTERNS = [
     "vocabulary.*",
 ]
 REQUIRED_LOCAL_FILES = ("model.bin", "config.json", "tokenizer.json")
+
+# Что обязано лежать в скачанном снапшоте, чтобы считать модель скачанной.
+CACHE_REQUIRED_FILES = ("model.bin", "config.json", "tokenizer.json")
+
+# А это — тот самый файл в 340 байт, без которого модель «скачана» и не работает:
+# faster-whisper молча берёт дефолт 80 мел-бинов, WhisperModel поднимается
+# успешно, а КАЖДАЯ транскрипция падает на «Invalid input features shape:
+# expected (1, 128, 3000), got (1, 80, 3000)». Поймано на живом прогоне T-404:
+# 1,6 ГБ весов turbo доехали, а этот json — нет.
+# Требуем его не у всех: 128 бинов только у large-v3 и turbo-производных, а
+# Systran/faster-whisper-tiny…medium его вообще не публикуют (80 бинов — дефолт),
+# и общее требование объявило бы их всех «скачанными не полностью».
+MEL128_MARKERS = ("large-v3", "turbo")
+PREPROCESSOR_FILE = "preprocessor_config.json"
+
+
+def required_snapshot_files(repo_id: str) -> tuple[str, ...]:
+    """Обязательный состав снапшота для конкретного репозитория."""
+    name = (repo_id or "").lower()
+    if any(mark in name for mark in MEL128_MARKERS):
+        return CACHE_REQUIRED_FILES + (PREPROCESSOR_FILE,)
+    return CACHE_REQUIRED_FILES
 
 CT2_CONVERT_HINT = (
     "Модель не в формате CTranslate2 (нет model.bin, лежат веса transformers).\n\n"
@@ -331,6 +354,23 @@ def recommended_preset() -> str:
 
 
 # === Кэш на диске ===
+def missing_snapshot_files(path: Path, repo_id: str = "") -> list[str]:
+    """Какие обязательные файлы отсутствуют (или пусты) в папке снапшота.
+
+    `repo_id` решает, спрашивать ли `preprocessor_config.json` (см.
+    `required_snapshot_files`). Без него — только базовый состав.
+    """
+    out: list[str] = []
+    for name in required_snapshot_files(repo_id):
+        f = path / name
+        try:
+            if not f.exists() or f.stat().st_size == 0:
+                out.append(name)
+        except OSError:
+            out.append(name)
+    return out
+
+
 def _snapshot_path(repo_id: str, cache_dir: Optional[Path]) -> Optional[Path]:
     """Путь к ПОЛНОМУ снапшоту в кэше или None (сеть не трогаем).
 
@@ -338,7 +378,9 @@ def _snapshot_path(repo_id: str, cache_dir: Optional[Path]) -> Optional[Path]:
     докачаться не успели (в blobs лежит `.incomplete`, в снапшоте — только
     json'ы). Ловили ровно это: оборванная закачка turbo считалась «скачано»,
     а `WhisperModel` падал с «Unable to open file 'model.bin'». Поэтому
-    дополнительно проверяем сам `model.bin`.
+    дополнительно проверяем состав снапшота — T-404 добавил в проверку остальные
+    обязательные файлы (см. `CACHE_REQUIRED_FILES`): одного `model.bin` мало,
+    без `preprocessor_config.json` модель грузится и не работает.
     """
     try:
         from huggingface_hub import snapshot_download
@@ -353,8 +395,9 @@ def _snapshot_path(repo_id: str, cache_dir: Optional[Path]) -> Optional[Path]:
         )
     except Exception:
         return None
-    weights = path / "model.bin"
-    if not weights.exists() or weights.stat().st_size == 0:
+    missing = missing_snapshot_files(path, repo_id)
+    if missing:
+        log(f"снапшот {repo_id} неполный, нет: {', '.join(missing)}")
         return None
     return path
 
@@ -387,6 +430,250 @@ def _cache_dir_for(spec: str) -> Optional[Path]:
     if _snapshot_path(repo, default_hf_cache()) is not None:
         return None
     return root
+
+
+# === Скачивание: ошибки, которые обязаны дойти до окна (T-404) ===
+DOWNLOAD_ATTEMPTS = 3       # обрыв на полпути — норма под VPN; hub докачивает с места
+RETRY_PAUSE_SEC = 3         # пауза перед повтором, растёт линейно с номером попытки
+
+# Имена классов исключений, по которым узнаём «сеть, а не логика». Сверяем по
+# имени, чтобы не тащить httpx/huggingface_hub в импорт ради одного isinstance.
+_NETWORK_EXC_NAMES = (
+    "ConnectError", "ConnectTimeout", "ConnectionError", "ReadError", "ReadTimeout",
+    "WriteTimeout", "PoolTimeout", "ProxyError", "RemoteProtocolError", "SSLError",
+    "SSLEOFError", "TimeoutError", "gaierror", "LocalEntryNotFoundError",
+    "OfflineModeIsEnabled", "HfHubHTTPError", "socket.timeout",
+)
+
+
+class ModelDownloadError(RuntimeError):
+    """Веса не скачались. Несёт человеческую причину и следующий шаг.
+
+    До T-404 сюда прилетал сырой `LocalEntryNotFoundError` с абзацем
+    английского текста про snapshot folder — и уходил в `_crash.log`, а
+    пользователь смотрел на «идёт работа» вечно. Теперь у ошибки есть `hint`
+    («что делать»), и оба поля показывает окно.
+    """
+
+    def __init__(self, message: str, *, hint: str = "", cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
+        self.cause = cause
+
+    def full_text(self) -> str:
+        return f"{self}\n\n{self.hint}" if self.hint else str(self)
+
+
+def _exc_chain(exc: BaseException) -> list[BaseException]:
+    """Исключение и вся его цепочка причин (`__cause__` / `__context__`)."""
+    out: list[BaseException] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    return any(
+        type(e).__name__ in _NETWORK_EXC_NAMES
+        or f"{type(e).__module__}.{type(e).__name__}" in _NETWORK_EXC_NAMES
+        for e in _exc_chain(exc)
+    )
+
+
+# huggingface_hub 1.x держит ОДИН общий httpx.Client на процесс. Обрыв TLS на
+# полпути умеет закрыть его насовсем, и все дальнейшие запросы падают с этим
+# текстом — до перезапуска приложения. Поймано на живом прогоне T-404: 1,6 ГБ
+# весов доехали, а маленький `preprocessor_config.json` уже не смог.
+_CLOSED_CLIENT_MARK = "client has been closed"
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if _is_network_error(exc):
+        return True
+    return any(_CLOSED_CLIENT_MARK in str(e).lower() for e in _exc_chain(exc))
+
+
+_download_proxy: str = ""
+
+
+def set_download_proxy(value: str, logger: Callable[[str], None] = log) -> None:
+    """Прокси, через который качать веса (T-404). Пусто — как настроена система.
+
+    Зачем отдельная настройка, а не «не использовать системный прокси»: обход
+    системного прокси маршрут не меняет — VPN-туннель перехватывает трафик по
+    IP, и запрос всё равно уходит через ту же ноду, которая теряет
+    huggingface.co. Помогает только явный адрес маршрута, который работает.
+    """
+    global _download_proxy
+    value = (value or "").strip()
+    if value == _download_proxy:
+        return
+    _download_proxy = value
+    _reset_hub_session(logger)  # клиент httpx читает прокси при создании
+    logger(f"прокси для скачивания моделей: {value or 'как в системе'}")
+
+
+def download_proxy() -> str:
+    return _download_proxy
+
+
+class _DownloadRoute:
+    """Контекст: на время сетевой работы hub'а подставить свой прокси в env.
+
+    Через env, а не через `set_client_factory`, намеренно: фабрика клиента у
+    hub'а несёт свои event-хуки (user-agent, телеметрия), и переписывать её
+    заново — расходиться с библиотекой на каждом её обновлении. httpx читает
+    `HTTPS_PROXY` при создании клиента, поэтому клиент сбрасываем на входе и
+    на выходе.
+    """
+
+    _KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
+
+    def __init__(self, logger: Callable[[str], None] = log) -> None:
+        self._logger = logger
+        self._saved: dict[str, Optional[str]] = {}
+
+    def __enter__(self) -> "_DownloadRoute":
+        if not _download_proxy:
+            return self
+        self._saved = {k: os.environ.get(k) for k in self._KEYS}
+        for key in self._KEYS:
+            os.environ.pop(key, None)
+        os.environ["HTTPS_PROXY"] = _download_proxy
+        os.environ["HTTP_PROXY"] = _download_proxy
+        _reset_hub_session(self._logger)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if not self._saved:
+            return
+        for key, val in self._saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        self._saved = {}
+        _reset_hub_session(self._logger)
+
+
+def _reset_hub_session(logger: Callable[[str], None] = log) -> None:
+    """Выбросить общий httpx-клиент hub'а: следующий запрос создаст новый."""
+    try:
+        from huggingface_hub.utils import close_session
+
+        close_session()
+    except Exception as exc:  # старые версии hub клиент не кэшируют — и не надо
+        logger(f"сброс HTTP-клиента hub пропущен: {exc.__class__.__name__}")
+
+
+def system_proxy() -> str:
+    """Прокси, через который пойдёт скачивание, или "" — как строка для человека.
+
+    Смотрим ОБА источника, потому что httpx берёт оба: переменные окружения и
+    настройку Windows в реестре. Второй источник — та самая яма T-404: Karing
+    прописывает `127.0.0.1:3067` в WinINET, `HTTPS_PROXY` при этом пуст, и по
+    переменным окружения проблему не видно вообще.
+    """
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"):
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return f"{val} (переменная {var})"
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not int(enabled):
+                return ""
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        server = (server or "").strip()
+        return f"{server} (системный прокси Windows)" if server else ""
+    except OSError:
+        return ""
+
+
+def _download_error(exc: BaseException, repo: str) -> ModelDownloadError:
+    """Перевести исключение скачивания в текст, который не стыдно показать."""
+    label = spec_display(repo)
+    if _is_retryable(exc):
+        proxy = system_proxy()
+        where = f"через {proxy}" if proxy else "напрямую"
+        detail = next(
+            (f"{type(e).__name__}: {e}".strip() for e in reversed(_exc_chain(exc)) if str(e).strip()),
+            type(exc).__name__,
+        )
+        return ModelDownloadError(
+            f"Нет связи с huggingface.co — модель {label} не скачалась.",
+            hint=(
+                f"Запрос шёл {where}. Так бывает, когда VPN уводит huggingface.co "
+                "в маршрут, который его теряет: остальные сайты работают, а этот "
+                "нет. Два выхода — правило «прямое соединение» для huggingface.co "
+                "и hf.co в VPN-клиенте либо поле «Прокси для загрузки моделей» в "
+                f"настройках (адрес маршрута, который работает).\nПодробно: {detail[:300]}"
+            ),
+            cause=exc,
+        )
+    if type(exc).__name__ in ("OSError", "PermissionError") or "No space" in str(exc):
+        return ModelDownloadError(
+            f"Не удалось записать веса {label} на диск.",
+            hint=f"Проверь место и права на {models_root()}.\nПодробно: {exc}",
+            cause=exc,
+        )
+    return ModelDownloadError(
+        f"Модель {label} не скачалась: {type(exc).__name__}: {exc}",
+        hint="Попробуй ещё раз; если повторяется — смотри runtime\\saytype.log в профиле.",
+        cause=exc,
+    )
+
+
+def _repo_cache_dir(repo_id: str, root: Path) -> Path:
+    """Папка репозитория в HF-кэше: `models--автор--название`."""
+    return root / ("models--" + repo_id.replace("/", "--"))
+
+
+def _downloaded_bytes(repo_id: str, root: Path) -> int:
+    """Сколько байт репо уже лежит на диске (для честного старта прогресса)."""
+    path = _repo_cache_dir(repo_id, root)
+    return _dir_size(path) if path.is_dir() else 0
+
+
+def clean_partial_cache(repo_id: str, root: Optional[Path] = None,
+                        logger: Callable[[str], None] = log) -> bool:
+    """Снести огрызок кэша, в котором нет ни одного файла весов.
+
+    Состояние с живой машины (T-404): в папке модели остался только
+    `refs\\main` — ни `blobs`, ни `snapshots`. Такого на здоровой машине не
+    бывает: `refs` появляется первым, а всё остальное не доехало. Огрызок
+    оставляет ссылку на ревизию, снапшота которой нет, поэтому чистим целиком —
+    качать всё равно с нуля. Частично скачанные веса (`blobs/*.incomplete`)
+    НЕ трогаем: на них держится докачка с места.
+    """
+    root = root or models_root()
+    path = _repo_cache_dir(repo_id, root)
+    if not path.is_dir():
+        return False
+    blobs = path / "blobs"
+    has_blobs = blobs.is_dir() and any(blobs.iterdir())
+    snapshots = path / "snapshots"
+    has_snapshots = snapshots.is_dir() and any(snapshots.iterdir())
+    if has_blobs or has_snapshots:
+        return False
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        logger(f"огрызок кэша {path.name} не удалился: {exc}")
+        return False
+    logger(f"снесён огрызок кэша без весов: {path.name}")
+    return True
 
 
 def _repo_total_bytes(repo_id: str) -> int:
@@ -447,6 +734,12 @@ def ensure_downloaded(
 
     `progress_cb(done_bytes, total_bytes)` — total=0 значит «размер неизвестен»
     (показывай бесконечный прогресс). Локальные папки не качаются.
+
+    T-404: обрыв не равен провалу. Флапающий маршрут (VPN, мобильная сеть)
+    рвёт закачку на полпути, а hub умеет продолжить с места — поэтому
+    `DOWNLOAD_ATTEMPTS` попыток с паузой, и только потом отказ. Любой отказ
+    уходит наверх как `ModelDownloadError` с причиной и следующим шагом:
+    вызывающий обязан показать это в окне, а не оставить «идёт работа».
     """
     if is_local_path(spec):
         if not Path(spec).is_dir():
@@ -460,22 +753,70 @@ def ensure_downloaded(
 
     root = models_root()
     root.mkdir(parents=True, exist_ok=True)
+    # Огрызок от прошлой оборванной попытки (папка есть, весов нет) — снести до
+    # старта, иначе он остаётся висеть после успеха и путает следующий запуск.
+    clean_partial_cache(repo, root, logger)
+    with _DownloadRoute(logger):
+        _download_snapshot(repo, spec, root, progress_cb, logger)
+
+
+def _download_snapshot(repo: str, spec: str, root: Path,
+                       progress_cb: Optional[Callable[[int, int], None]],
+                       logger: Callable[[str], None]) -> None:
+    """Тело скачивания: метаданные, попытки с докачкой, проверка состава."""
     total = _repo_total_bytes(repo)
     logger(f"скачиваю {repo} → {root} ({total / 1e6:.0f} МБ)" if total else f"скачиваю {repo} → {root}")
+    if _download_proxy:
+        logger(f"маршрут скачивания: {_download_proxy}")
 
     from huggingface_hub import snapshot_download
 
     tqdm_cls = _make_progress_tqdm()
-    with _dl_lock:
-        _dl_state.update({"cb": progress_cb, "done": 0, "total": total})
+    kwargs = {"allow_patterns": ALLOW_PATTERNS, "cache_dir": str(root)}
+    if tqdm_cls is not None and progress_cb is not None:
+        kwargs["tqdm_class"] = tqdm_cls
     try:
-        kwargs = {"allow_patterns": ALLOW_PATTERNS, "cache_dir": str(root)}
-        if tqdm_cls is not None and progress_cb is not None:
-            kwargs["tqdm_class"] = tqdm_cls
-        snapshot_download(repo, **kwargs)
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            # Прогресс начинаем не с нуля, а с того, что уже лежит на диске:
+            # после обрыва докачка продолжает файл, и счётчик tqdm считает
+            # только новые байты — иначе шкала после повтора врала бы вдвое.
+            with _dl_lock:
+                _dl_state.update({
+                    "cb": progress_cb, "done": _downloaded_bytes(repo, root), "total": total,
+                })
+            try:
+                snapshot_download(repo, **kwargs)
+                break
+            except Exception as exc:
+                last = attempt >= DOWNLOAD_ATTEMPTS
+                if last or not _is_retryable(exc):
+                    raise _download_error(exc, repo) from exc
+                logger(f"скачивание {repo}: попытка {attempt}/{DOWNLOAD_ATTEMPTS} "
+                       f"оборвалась ({type(exc).__name__}) — продолжу с места")
+                # Клиент мог остаться закрытым после обрыва — тогда повтор без
+                # сброса упал бы мгновенно и «повторов» было бы три пустых.
+                _reset_hub_session(logger)
+                time.sleep(RETRY_PAUSE_SEC * attempt)
     finally:
         with _dl_lock:
             _dl_state.update({"cb": None, "done": 0, "total": 0})
+    if not is_cached(spec):
+        # snapshot_download отработал, но состав неполный: так выглядит и
+        # выкачка одних json'ов, и потерянный `preprocessor_config.json` при
+        # доехавших весах (см. `CACHE_REQUIRED_FILES`).
+        snap_dir = _repo_cache_dir(repo, root) / "snapshots"
+        missing: list[str] = []
+        if snap_dir.is_dir():
+            for rev in snap_dir.iterdir():
+                missing = missing_snapshot_files(rev, repo)
+                if missing:
+                    break
+        raise ModelDownloadError(
+            f"Модель {spec_display(repo)} скачалась не полностью"
+            + (f" — не хватает: {', '.join(missing)}." if missing else "."),
+            hint="Нажми «Скачать» ещё раз — недостающие файлы докачаются, "
+                 f"уже скачанное не пропадёт. Папка: {_repo_cache_dir(repo, root)}",
+        )
     logger(f"скачано: {repo}")
 
 
@@ -512,7 +853,10 @@ def validate_repo_id(repo_id: str, timeout: int = 20) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"huggingface_hub недоступен: {exc}"
     try:
-        info = HfApi().model_info(repo_id, timeout=timeout)
+        # Тот же маршрут, что у скачивания (T-404): иначе «своя модель» не
+        # проверяется на машине, где HF доступен только через свой прокси.
+        with _DownloadRoute():
+            info = HfApi().model_info(repo_id, timeout=timeout)
     except RepositoryNotFoundError:
         return False, f"Репозиторий `{repo_id}` не найден на HuggingFace (404). Проверь написание."
     except GatedRepoError:

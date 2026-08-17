@@ -40,7 +40,7 @@ build, and how this project satisfies it:
 
 | Component | Version | Why it is here |
 |---|---|---|
-| FFmpeg (`avcodec`, `avformat`, `avutil`, `swresample`, `swscale`) | n7.1.3 | shipped inside PySide6; Qt Multimedia's media backend, used by the built-in player |
+| FFmpeg (`avcodec`, `avformat`, `avutil`, `swresample`, `swscale`) | n7.1.3 | shipped inside PySide6; Qt Multimedia's media backend, used by the built-in player and by `QAudioDecoder` when an audio file is imported for transcription |
 
 Not a dependency of this project — it arrives with the PySide6 wheels. Qt builds
 it **without** `--enable-gpl`, so `libx264` and `libx265` are absent and the
@@ -121,11 +121,15 @@ Without the layer the application still works: CTranslate2 falls back to CPU int
 includes `libx264` and `libx265` — encoders under **GPLv2+**. One such file in a
 distribution puts the whole distribution under the GPL, whatever this project's
 own license says. SayType therefore excludes PyAV from the build. Nothing is lost:
-the application never decodes media files. Dictation and call recording hand the
-model a NumPy array, and WAV files are read with the standard library's `wave`.
-Because `faster_whisper` imports `av` at module level, a stub module takes its
-place in the frozen build (`packaging/av_stub_rthook.py`); touching it raises a
-clear error instead of silently doing nothing.
+the model is always handed a NumPy array, never a file path — a path is what would
+pull PyAV in. Dictation and call recording produce that array from the microphone
+stream; WAV files are read with the standard library's `wave`; and imported media
+files are decoded by Qt Multimedia's FFmpeg, which is already part of the build
+(see *LGPL-2.1 — FFmpeg inside Qt Multimedia* above) and carries no GPL
+component — it decodes into that same NumPy array. Because `faster_whisper`
+imports `av` at module level, a stub module takes its place in the frozen build
+(`packaging/av_stub_rthook.py`); touching it raises a clear error instead of
+silently doing nothing.
 
 **ffmpeg (the executable).** Prebuilt ffmpeg binaries are GPL-licensed, so none is
 shipped. It is used only to convert a recorded call to MP3, is looked up in `PATH`

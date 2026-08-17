@@ -14,11 +14,19 @@
 Диалог с ошибкой при каждом запуске оффлайн-инструмента раздражает сильнее, чем
 приносит пользы; ручную проверку из настроек, наоборот, надо доводить до ответа —
 человек нажал кнопку и ждёт результата.
+
+Про заметки релиза (T-328). Текст «что изменилось» кладётся в пакет при сборке
+(`vpk pack --releaseNotes`, источник — CHANGELOG.md) и приходит вместе с самим
+ответом фида. Отдельного запроса к GitHub API нет намеренно: второй сетевой
+вызов означал бы второе место, где текст может не прийти, и второй таймаут в
+диалоге, который человек уже открыл. Нет заметок — окно показывается как
+раньше, без пустого блока: это норма, а не сбой.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 from typing import Callable, Optional
@@ -134,6 +142,60 @@ def version_of(info) -> str:
         return str(info.TargetFullRelease.Version)
     except Exception:
         return "?"
+
+
+def notes_of(info, max_lines: int = 8, max_chars: int = 700) -> str:
+    """Заметки релиза обычным текстом. Нечего показать — пустая строка.
+
+    Вызывающий сам решает, что делать с пустотой; ошибок отсюда не прилетает
+    ни при каком содержимом фида. Markdown упрощается до текста, потому что
+    показывается в QMessageBox: заголовок с номером версии выкидываем (он уже
+    в шапке окна), список отбиваем «•», ссылку оставляем текстом.
+    """
+    try:
+        raw = str(getattr(info.TargetFullRelease, "NotesMarkdown", "") or "")
+    except Exception:
+        return ""
+    # Комментарии markdown — служебные пометки для того, кто ведёт CHANGELOG.md;
+    # человеку в окне обновления они не адресованы. Поймано живым прогоном:
+    # маркер из файла доехал до диалога и встал отдельным пунктом.
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
+    lines: list[str] = []
+    dropped = 0
+    continues = False  # предыдущая строка была началом пункта или абзаца
+    for source in raw.splitlines():
+        text = source.strip()
+        if not text or text.startswith("#") or set(text) <= set("-=*_ "):
+            continues = False  # пустая строка или заголовок разрывают абзац
+            continue
+        bullet = bool(re.match(r"^[-*+]\s+", text))
+        text = re.sub(r"^[-*+]\s+", "", text)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)   # ссылка → её текст
+        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        if not text:
+            continue
+        # Перенос строки в исходнике — не новый пункт. В CHANGELOG.md строки
+        # переносятся по ширине, и без склейки хвост длинного пункта поехал бы
+        # в окне отдельной строкой без «•», как будто это другое изменение.
+        if continues and not bullet and lines:
+            lines[-1] += " " + text
+            continue
+        if len(lines) >= max_lines:
+            dropped += 1
+            continues = False
+            continue
+        lines.append(("• " + text) if bullet else text)
+        continues = True
+    if not lines:
+        return ""
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        result = result[:max_chars].rstrip() + "…"
+        dropped += 1
+    if dropped:
+        result += "\n…и ещё изменения — полный список на странице релиза."
+    return result
 
 
 def download_and_apply(

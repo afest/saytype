@@ -38,6 +38,11 @@ _repro_*
 *.f32raw
 *.raw
 *.callmeta.json
+# Exception: synthetic test fixtures (a generated sine wave, no speech, no personal
+# data). The mp3 one is not reproducible at test time — encoding it would require a
+# bundled encoder — so it travels with the repository (T-351).
+!tests/fixtures/*.mp3
+!tests/fixtures/*.wav
 
 # --- editors / OS ---
 .vscode/

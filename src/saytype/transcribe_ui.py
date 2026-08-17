@@ -172,9 +172,11 @@ from pathlib import Path
 
 # T-259: engine — единственная точка загрузки модели. Его импорт настраивает
 # CUDA DLL-пути (Windows), поэтому идёт ДО всего, что тянет ctranslate2.
+from . import audio_import  # T-351: декодер файла + контракт FileImportApi
 from . import cuda_layer
 from . import engine
 from . import profile
+from . import sound
 from . import updater
 
 import numpy as np
@@ -209,6 +211,8 @@ from .transcribe_call import (
     recover_recording_to_wav,
     cleanup_raw_log,
     RAW_META_SUFFIX,
+    _wav_duration_sec,
+    _resample_to_target,  # T-389: hi-fi запись → 16-кГц копия для Whisper
 )
 
 # Дай splash шанс перерисоваться после долгих импортов
@@ -449,6 +453,7 @@ model = None
 window: "MainWindow | None" = None
 captured_hwnd: int = 0  # foreground-окно на момент начала записи (для автопаста обратно)
 via_ui_request: bool = False  # True если последняя запись запущена через UI-кнопку (без автопаста)
+note_dictation: bool = False  # T-352: True — текст уходит в открытую заметку, а не в историю/автопаст
 streaming_processor: "StreamingProcessor | None" = None  # T-131: каркас фонового LA-2 worker'а
 pre_roll: "PreRollBuffer | None" = None  # T-164: rolling deque pre-roll буфер
 _pre_roll_used: bool = False  # True если последняя запись начата с pre-roll snapshot'ом
@@ -460,10 +465,18 @@ call_active: bool = False
 call_dictation_start_idx: "int | None" = None  # курсор начала среза диктовки в mic-буфере CallRecorder
 call_busy: bool = False  # финализация созвона идёт в worker'е — защита от двойного стопа
 
+# T-351: идёт импорт аудиофайла (декодирование + транскрипция). Отдельный флаг, а
+# не `busy`: тот принадлежит циклу записи с микрофона и сбрасывается `_stop_thread`.
+import_busy: bool = False
+
 # T-165: hybrid streaming/batch — snapshot режима на момент hotkey-down
 # (изменение в Settings во время записи не применяется к текущей, только к следующей).
 _active_processing_mode: str = "auto"  # "auto" | "always_batch" | "always_streaming"
 _active_auto_threshold_sec: int = 10
+# T-389: частота текущей записи. Snapshot на hotkey-down, как и режим обработки:
+# SAMPLE_RATE (16000) в обычной диктовке, 44100/48000 — когда включена hi-fi.
+_active_rate: int = SAMPLE_RATE
+_active_hifi: bool = False  # True — запись этой сессии идёт в папку-карантин датасета
 # T-284: поколение auto-таймера вместо ссылки на сам QTimer. Отменяет отсчёт
 # worker-поток (`_stop_thread`), а QTimer живёт в GUI-потоке — трогать его
 # оттуда нельзя: `stop()` Qt молча игнорирует («Timers cannot be stopped from
@@ -761,14 +774,44 @@ def active_model_spec() -> str:
     return engine.spec_from_settings(SETTINGS)
 
 
-def load_model(spec: "str | None" = None, progress_cb=None, force_reload: bool = False):
+def report_error(title: str, text: str, hint: str = "") -> None:
+    """Показать сбой человеку (T-404) — окно + toast, а не только `_crash.log`.
+
+    Зовётся из worker-потоков: у окна для этого есть thread-safe `notify_error`.
+    Если окна нет вообще (batch-режим, ранний старт) — остаётся лог, но тогда
+    и смотреть некому.
+    """
+    log(f"[ERROR] {title}: {text}" + (f" | {hint}" if hint else ""))
+    if window is None:
+        return
+    try:
+        window.notify_error(title, text, hint)
+    except Exception as exc:
+        log(f"notify_error fail: {exc}")
+
+
+def load_model(spec: "str | None" = None, progress_cb=None, force_reload: bool = False,
+               allow_download: bool = True):
     """Обёртка над engine.load_model — кэш модели, double-checked locking и
     fallback-цепочка compute_type живут в engine (T-259, одна точка на проект).
 
     `progress_cb(done_bytes, total_bytes)` пробрасывается в скачивание модели.
+
+    `allow_download=False` — «грузи только то, что уже на диске». Ставится во
+    всех путях, где показать прогресс негде: диктовка, созвон, импорт файла,
+    preload. T-404: без этого стоп записи уходил качать 1,6 ГБ внутри своего
+    потока — молча, без шкалы и без отмены, и на мёртвом маршруте выглядел как
+    «транскрибирую» до конца сессии. Качаем там, где есть окно с прогрессом:
+    раздел «Модели» и старт приложения.
     """
     global model, MODEL_DEVICE, MODEL_COMPUTE_TYPE
     spec = spec or active_model_spec()
+    if not allow_download and not engine.is_loaded(spec) and not engine.is_cached(spec):
+        raise engine.ModelDownloadError(
+            f"Модель {engine.spec_display(spec)} не скачана — распознавать нечем.",
+            hint="Открой раздел «Модели» и нажми «Скачать»: там видно прогресс "
+                 "и понятно, чем закончилось.",
+        )
     m = engine.load_model(spec, logger=log, progress_cb=progress_cb, force_reload=force_reload)
     if m is not model:
         _check_prompt_budget(m)
@@ -780,6 +823,24 @@ def load_model(spec: "str | None" = None, progress_cb=None, force_reload: bool =
         model=f"{engine.spec_display(spec)} ({MODEL_DEVICE}/{MODEL_COMPUTE_TYPE})"
     )
     return m
+
+
+def load_model_background(spec: "str | None" = None, reason: str = "") -> None:
+    """Поднять модель в фоне так, чтобы сбой не потерялся (T-404).
+
+    Цель для `threading.Thread(target=...)`: раньше туда отдавали сам
+    `load_model`, и любое исключение (нет весов, нет сети, не собрался CUDA)
+    улетало в `threading.excepthook` → `_crash.log`. Пользователь при этом
+    видел прежнее состояние UI и ничего не знал.
+    """
+    try:
+        load_model(spec, allow_download=False)
+    except Exception as exc:
+        report_error(
+            "Модель не загрузилась",
+            f"{exc}" + (f"\n\n({reason})" if reason else ""),
+            getattr(exc, "hint", ""),
+        )
 
 
 def switch_model(spec: str, progress_cb=None):
@@ -815,6 +876,30 @@ def history_dir() -> Path:
 
 def rotation_count() -> int:
     return int(SETTINGS.get("rotation_count", 5))
+
+
+def rotation_minutes() -> float:
+    # T-386: опциональный порог по суммарной длительности (датасет клона голоса).
+    # 0 (дефолт) = выключено, ротация только по rotation_count, как раньше.
+    return float(SETTINGS.get("rotation_minutes", 0))
+
+
+def hifi_enabled() -> bool:
+    # T-389: hi-fi надиктовка — материал для клона голоса пишется на 44.1/48 кГц
+    # в отдельную папку, минуя ротацию истории. Whisper при этом получает
+    # 16-кГц копию, распознавание не меняется.
+    return bool(SETTINGS.get("hifi_enabled", False))
+
+
+def hifi_rate() -> int:
+    rate = int(SETTINGS.get("hifi_sample_rate", 44100))
+    return rate if rate in (44100, 48000) else 44100
+
+
+def hifi_dir() -> Path:
+    """Папка-карантин hi-fi записей. `rotate_history()` сканит только корень
+    истории и сюда не заглядывает — накопленное не удаляется само."""
+    return history_dir() / profile.HIFI_SUBDIR
 
 
 def call_audio_keep() -> int:
@@ -899,7 +984,7 @@ def _on_auto_threshold_fire(generation: int) -> None:
 def start_recording() -> None:
     global recording, audio_buffer, audio_stream, _last_level_ms, _pre_roll_used
     global _active_processing_mode, _active_auto_threshold_sec, _streaming_worker_started
-    global _auto_timer_generation
+    global _auto_timer_generation, _active_rate, _active_hifi
     audio_buffer = []
     recording = True
     _last_level_ms = 0
@@ -915,10 +1000,31 @@ def start_recording() -> None:
     _active_auto_threshold_sec = int(SETTINGS.get("auto_threshold_sec", 10))
     _active_auto_threshold_sec = max(1, min(60, _active_auto_threshold_sec))
 
+    # T-389: частота записи — тем же snapshot'ом, что и режим. Hi-fi форсит
+    # always_batch: streaming-worker режет чанки, считая всю цепочку 16-кГц
+    # (`transcribe_streaming.py`), и второй sample rate там пришлось бы
+    # протаскивать сквозь LCP-логику ради режима, который включают на время
+    # набора датасета. На стопе отработает обычный full-pass.
+    _active_hifi = hifi_enabled()
+    _active_rate = hifi_rate() if _active_hifi else SAMPLE_RATE
+    if _active_hifi and _active_processing_mode != "always_batch":
+        log(
+            f"hi-fi: processing_mode {_active_processing_mode} → always_batch "
+            f"на эту запись (streaming-путь работает только на {SAMPLE_RATE} Гц)"
+        )
+        _active_processing_mode = "always_batch"
+
     # T-164: pre-roll — дописываем последние ~500мс из rolling deque ПЕРЕД
     # свежим аудио. Whisper-encoder получает «прогрев» (тишина/фон до речи),
     # LA-2 не commit'ит нестабильный второй вариант на первых токенах.
-    if pre_roll is not None and pre_roll.is_running():
+    #
+    # T-389: при hi-fi snapshot НЕ приклеиваем. PreRollBuffer держит свой поток
+    # на 16 кГц (его не трогаем — он про head-loss, а не про датасет), и эти
+    # 500 мс в 44.1-кГц буфере растянулись бы в полторы секунды замедленного
+    # звука — и в файле датасета, и в том, что услышит Whisper.
+    if _active_hifi and pre_roll is not None and pre_roll.is_running():
+        log("hi-fi: pre-roll snapshot пропущен (буфер 16 кГц, запись на другой частоте)")
+    elif pre_roll is not None and pre_roll.is_running():
         snap = pre_roll.snapshot()
         if snap.size > 0:
             audio_buffer.append(snap)
@@ -951,14 +1057,31 @@ def start_recording() -> None:
                 except Exception:
                     pass  # эквалайзер не должен ронять запись
 
-    audio_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32",
-        device=mic_device(),  # T-263: выбранный микрофон или системный
-        callback=cb,
-    )
-    audio_stream.start()
+    def _open_stream(rate: int):
+        stream = sd.InputStream(
+            samplerate=rate, channels=CHANNELS, dtype="float32",
+            device=mic_device(),  # T-263: выбранный микрофон или системный
+            callback=cb,
+        )
+        stream.start()
+        return stream
+
+    try:
+        audio_stream = _open_stream(_active_rate)
+    except Exception as exc:
+        # T-389: микрофон может не отдать выбранную частоту (драйвер, занятое
+        # устройство). Датасет — дело наживное, а вот потерянная надиктовка
+        # невосполнима: откатываемся на 16 кГц и пишем как обычно.
+        if not _active_hifi:
+            raise
+        log(f"hi-fi: {_active_rate} Гц не открылись ({exc!r}) — пишу обычную диктовку 16 кГц")
+        _active_hifi = False
+        _active_rate = SAMPLE_RATE
+        audio_stream = _open_stream(_active_rate)
     set_state("recording")  # overlay покажет «● Запись» + эквалайзер
-    log("recording started")
+    log(f"recording started ({_active_rate} Hz{', hi-fi' if _active_hifi else ''})")
+    if SETTINGS.get("sound_notifications_dictation", True):
+        sound.play_start()  # T-355: main thread, QSoundEffect уже прогрет — не задерживает старт
     # T-278: раньше маркер молчал от hotkey-down до стопа — десятки секунд, в
     # которые смерть выглядела как смерть в простое. Ветки ниже могут уточнить
     # запись («streaming-worker считает на GPU»).
@@ -1001,6 +1124,10 @@ def stop_recording_and_transcribe() -> None:
     stream, buf = audio_stream, audio_buffer
     audio_stream, audio_buffer = None, []
     recording = False
+    if SETTINGS.get("sound_notifications_dictation", True) and window is not None:
+        # T-355: QSoundEffect — main-thread-only, отсюда (worker-поток) только
+        # через сигнал, как и остальные Qt-обращения в этой функции (см. докстринг).
+        window.notify_stop_sound()
     # T-165: отменить ARMED auto-timer ДО закрытия потока — иначе после стопа
     # timer ещё может выстрелить и стартануть worker на уже пустой audio_buffer.
     # T-284: отмена = инкремент поколения. Сам QTimer не трогаем: мы в чужом
@@ -1032,25 +1159,71 @@ def stop_recording_and_transcribe() -> None:
         return
 
     audio_np = np.concatenate(buf, axis=0)
-    dur_sec = len(audio_np) / SAMPLE_RATE
+    # T-389: длительность и путь к модели считаются от частоты ЭТОЙ записи —
+    # в hi-fi буфер приходит 44.1/48 кГц, и деление на 16000 завысило бы её втрое.
+    dur_sec = len(audio_np) / _active_rate
     crashguard.mark(f"транскрипция диктовки {dur_sec:.0f} сек")
 
-    hdir = history_dir()
-    hdir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    wav_path = hdir / f"{ts}.wav"
-    txt_path = hdir / f"{ts}.txt"
+    # T-389: при hi-fi оригинал на native rate уходит в датасет ОТДЕЛЬНЫМ файлом,
+    # а всё остальное (история, карточки в окне, ротация, транскрипция) работает
+    # с привычной 16-кГц версией. Иначе включённый режим уносил бы надиктовки из
+    # окна целиком — ровно это и вылезло на живом прогоне.
+    hifi_pcm16 = None
+    if _active_hifi:
+        hifi_pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+        # Тот же ресемплер, что сводит канал собеседника в созвонах.
+        audio_np = _resample_to_target(hifi_pcm16, _active_rate, SAMPLE_RATE).astype(np.float32) / 32767.0
 
-    pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
-    with wave.open(str(wav_path), "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(pcm16.tobytes())
-    log(f"saved {wav_path.name} ({dur_sec:.1f}s)")
+    hdir = history_dir()
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+    # T-352: диктовка в заметку не пишется в ротируемую историю вообще (ни wav,
+    # ни txt/meta ниже) — заметка не «последние N, потом сотрётся», а обратное.
+    if not note_dictation:
+        hdir.mkdir(parents=True, exist_ok=True)
+        wav_path = hdir / f"{ts}.wav"
+        txt_path = hdir / f"{ts}.txt"
+
+        pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm16.tobytes())
+        log(f"saved {wav_path.name} ({dur_sec:.1f}s)")
+
+        if hifi_pcm16 is not None:
+            # Копия для клона голоса: своя папка вне ротации (`rotate_history()`
+            # сканирует только корень). Сбой записи датасета не должен уносить
+            # уже сохранённую надиктовку — отсюда отдельный try.
+            try:
+                hdir_hifi = hifi_dir()
+                hdir_hifi.mkdir(parents=True, exist_ok=True)
+                hifi_wav = hdir_hifi / f"{ts}.wav"
+                with wave.open(str(hifi_wav), "wb") as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(2)
+                    wf.setframerate(_active_rate)
+                    wf.writeframes(hifi_pcm16.tobytes())
+                log(f"saved hi-fi {hifi_wav.name} ({dur_sec:.1f}s, {_active_rate} Hz)")
+            except Exception as exc:
+                log(f"hi-fi save fail: {exc}")
 
     t0 = time.time()
-    m = load_model()
+    # T-404: модель грузим только из кэша. Скачивание отсюда запрещено —
+    # это поток стопа записи, в нём нет ни шкалы, ни отмены, а на плохом
+    # маршруте оно висит минутами и выглядит как зависшая транскрипция.
+    try:
+        m = load_model(allow_download=False)
+    except Exception as exc:
+        hint = getattr(exc, "hint", "")
+        where = f"\n\nЗапись сохранена: {wav_path}" if not note_dictation else ""
+        report_error(
+            "Не удалось распознать запись",
+            f"{exc}{where}",
+            hint,
+        )
+        return
     info_lang = "ru"
 
     # T-132: развилка по streaming. Tail-merge только если worker накопил
@@ -1195,6 +1368,15 @@ def stop_recording_and_transcribe() -> None:
     elapsed = time.time() - t0
     ratio = dur_sec / elapsed if elapsed > 0 else 0
     log(f"transcribed: {len(text)} chars, {elapsed:.1f}s, {ratio:.1f}x, lang={info_lang}")
+
+    if note_dictation:
+        # T-352: ни файла, ни ротации, ни автопаста — текст уходит прямо в
+        # редактор открытой заметки. `_stop_thread.finally` сбросит флаг.
+        crashguard.mark("после транскрипции (заметка): доставка текста в редактор")
+        if window is not None:
+            window.notify_note_text(text)
+        return
+
     # T-284: раньше здесь стояло «простой (транскрипция завершена)», хотя дальше
     # идёт ещё полдюжины шагов — авария на любом из них читалась в `_crash.log`
     # как смерть в простое. Отметки ниже разрезают этот участок: следующая
@@ -1202,6 +1384,13 @@ def stop_recording_and_transcribe() -> None:
     crashguard.mark("после транскрипции: сохраняю txt/meta/stats")
 
     txt_path.write_text(text, encoding="utf-8")
+    if _active_hifi:
+        # Текст рядом с hi-fi копией: при сборке датасета видно, что на записи
+        # сказано, без обращения к истории (её ротация к тому времени уже сотрёт).
+        try:
+            (hifi_dir() / f"{ts}.txt").write_text(text, encoding="utf-8")
+        except Exception as exc:
+            log(f"hi-fi txt save fail: {exc}")
 
     # Sidecar meta — длительность аудио, время транскрипции, скорость x realtime.
     # Статистика видна в таблице истории, а не всплывающим тостом.
@@ -1256,6 +1445,11 @@ def stop_recording_and_transcribe() -> None:
         else:
             rec["processing_mode"] = "batch_short"
         rec["auto_threshold_sec"] = int(_active_auto_threshold_sec)
+        # T-389: частота записи. Журнал общий для обоих режимов (он про скорость
+        # модели, а она работает на 16 кГц в любом случае) — но по этому полю
+        # видно, какие прогоны шли в датасет.
+        rec["sample_rate"] = int(_active_rate)
+        rec["hifi"] = bool(_active_hifi)
         if streaming_result is not None:
             rec["mode"] = "streaming"
             rec["streaming_chunks"] = int(streaming_result[2])
@@ -1307,11 +1501,32 @@ def stop_recording_and_transcribe() -> None:
 
 
 def rotate_history() -> None:
+    """Ротация надиктовок в корне папки истории.
+
+    По умолчанию — по количеству (`rotation_count`), как раньше. Если задан
+    `rotation_minutes` (T-386, > 0) — буфер держит и по суммарной длительности:
+    держим новые записи, пока накопленная длительность (от самой свежей) не
+    превысит порог; `rotation_count` при этом работает как пол (не меньше N
+    файлов в любом случае).
+    """
     hdir = history_dir()
     max_count = rotation_count()
+    keep_minutes = rotation_minutes()
     wavs = sorted(hdir.glob("*.wav"), key=lambda p: p.stat().st_mtime)
-    while len(wavs) > max_count:
-        oldest = wavs.pop(0)
+    if keep_minutes > 0:
+        newest_first = list(reversed(wavs))
+        keep_set = set()
+        total_sec = 0.0
+        for i, p in enumerate(newest_first):
+            if i < max_count or total_sec < keep_minutes * 60:
+                keep_set.add(p)
+                total_sec += _wav_duration_sec(p)
+            else:
+                break
+        to_remove = [p for p in wavs if p not in keep_set]
+    else:
+        to_remove = wavs[: max(0, len(wavs) - max_count)]
+    for oldest in to_remove:
         meta = oldest.parent / f"{oldest.stem}.meta.json"
         for p in (oldest, oldest.with_suffix(".txt"), meta):
             if p.exists():
@@ -1321,27 +1536,64 @@ def rotate_history() -> None:
                     log(f"rotate fail {p}: {exc}")
 
 
+def _transcribe_failure_hint(exc: BaseException) -> str:
+    """Подсказка под конкретный сбой транскрипции (T-404)."""
+    text = str(exc)
+    if "Invalid input features shape" in text:
+        # Ровно то, что даёт модель, скачанная без `preprocessor_config.json`:
+        # веса на диске, модель грузится, а каждая транскрипция падает.
+        return ("Похоже, модель скачана не полностью: без preprocessor_config.json "
+                "faster-whisper считает, что у модели 80 мел-каналов вместо 128. "
+                "Открой раздел «Модели» и нажми «Скачать» — недостающие файлы "
+                "докачаются, уже скачанное не пропадёт.")
+    return "Запись сохранена в истории — можно попробовать ещё раз после разбора причины."
+
+
 def _stop_thread() -> None:
-    global busy, via_ui_request
+    global busy, via_ui_request, note_dictation
+    was_note = note_dictation
     try:
         stop_recording_and_transcribe()
+    except Exception as exc:
+        # T-404: раньше любая авария после стопа записи уходила только в
+        # `_crash.log` — иконка возвращалась в серую, и это выглядело как «текст
+        # куда-то делся сам». Причина обязана дойти до человека.
+        report_error(
+            "Не удалось распознать запись",
+            f"{exc.__class__.__name__}: {exc}",
+            getattr(exc, "hint", "") or _transcribe_failure_hint(exc),
+        )
     finally:
         set_state("idle")  # гарантия возврата к серой иконке независимо от исходов
         busy = False
         via_ui_request = False
+        note_dictation = False
+        # T-352 (доработка после ревью): happy path уже дёрнул notify_note_text
+        # из stop_recording_and_transcribe — но пустой буфер (`if not buf: return`)
+        # и любое исключение до записи файлов туда не доходят, и кнопка «Диктовать»
+        # в NoteEditorDialog залипала на «Распознаю…» навсегда. `finally` — гарантированная
+        # точка после ЛЮБОГО исхода, поэтому уведомление шлём отсюда, а не с happy path.
+        # На успехе сигнал придёт вторым: `_on_note_text_ready` уже очистит
+        # `_note_dictation_target`, и этот — no-op (см. MainWindow._on_note_dictation_ended).
+        if was_note and window is not None:
+            window.notify_note_dictation_ended()
         # T-284: «простой» ставим ЗДЕСЬ — когда worker действительно закончил.
         # Раньше отметка стояла сразу после m.transcribe, и всё, что шло дальше
         # (сохранение, ротация, автопаст, обновление окна), выглядело простоем.
         crashguard.mark("простой (транскрипция завершена)")
 
 
-def toggle_recording(via_ui: bool = False) -> None:
-    """Старт/стоп записи. via_ui=True для записи через UI-кнопку (без автопаста)."""
-    global busy, via_ui_request, captured_hwnd
+def toggle_recording(via_ui: bool = False, to_note: bool = False) -> None:
+    """Старт/стоп записи. via_ui=True для записи через UI-кнопку (без автопаста).
+    to_note=True (T-352) — диктовка в открытую заметку: без автопаста, без
+    записи в ротируемую историю, результат уходит в редактор заметки."""
+    global busy, via_ui_request, note_dictation, captured_hwnd
     # T-172: во время записи созвона CallRecorder держит mic-поток. Обычная
     # диктовка НЕ может открыть свой sd.InputStream на том же устройстве (два
     # MME-потока конфликтуют), поэтому диктуем СРЕЗОМ из mic-буфера CallRecorder.
     # Этот путь полностью отдельный — не трогает audio_stream/recording/streaming.
+    # Диктовка в заметку поверх активного созвона не поддержана (редкий edge-case
+    # вне acceptance T-352) — уйдёт по обычной ветке созвона, to_note игнорируется.
     if call_active:
         _toggle_call_dictation(via_ui=via_ui)
         return
@@ -1349,7 +1601,8 @@ def toggle_recording(via_ui: bool = False) -> None:
         if busy:
             return
         if not recording:
-            via_ui_request = via_ui
+            via_ui_request = via_ui or to_note
+            note_dictation = to_note
             captured_hwnd = 0
             start_recording()
         else:
@@ -1434,6 +1687,11 @@ def trigger_recording_via_ui() -> None:
     toggle_recording(via_ui=True)
 
 
+def trigger_note_recording_via_ui() -> None:
+    """T-352: вызывается кнопкой диктовки внутри открытой заметки."""
+    toggle_recording(via_ui=True, to_note=True)
+
+
 # === T-172: запись созвона (второй режим) ===
 
 def _call_silence_alert(silent: bool) -> None:
@@ -1481,7 +1739,9 @@ def _call_finalize_thread(recording_obj) -> None:
         # «хранить аудио созвона» в Settings.
         result = finalize_recording(
             recording_obj,
-            model=load_model(),
+            # T-404: только из кэша — качать 1,6 ГБ внутри финализации созвона
+            # нельзя, там на руках несохранённый транскрипт.
+            model=load_model(allow_download=False),
             keep_audio=SETTINGS.get("keep_call_audio", False),
             call_audio_keep=call_audio_keep(),
             progress_cb=_progress,
@@ -1596,6 +1856,8 @@ def toggle_call_recording() -> None:
         call_active = True
         call_dictation_start_idx = None
         log("call recording: STARTED (ctrl+shift+E to stop)")
+        if SETTINGS.get("sound_notifications_call", True):
+            sound.play_start()
         # T-278: созвон длится десятки минут — без отметки вся эта дыра
         # читалась в _crash.log как «простой».
         crashguard.mark("идёт запись созвона")
@@ -1609,6 +1871,8 @@ def toggle_call_recording() -> None:
         rec = call_recorder
         call_recorder = None
         log("call recording: STOPPING, финализирую в фоне…")
+        if SETTINGS.get("sound_notifications_call", True):
+            sound.play_stop()
         try:
             recording_obj = rec.stop() if rec is not None else None
         except Exception as exc:
@@ -1648,7 +1912,12 @@ def _do_call_dictation_thread(start_idx: int, captured: int, via_ui: bool) -> No
             return
         # 2026-07-12: INITIAL_PROMPT сюда тоже не передавался — диктовка во время
         # созвона шла без словаря, в отличие от обычной диктовки.
-        segs = transcribe_channel(load_model(), clip, initial_prompt=INITIAL_PROMPT)
+        try:
+            m_call = load_model(allow_download=False)  # T-404: качать посреди созвона нельзя
+        except Exception as exc:
+            report_error("Диктовка в созвоне не распознана", str(exc), getattr(exc, "hint", ""))
+            return
+        segs = transcribe_channel(m_call, clip, initial_prompt=INITIAL_PROMPT)
         raw = " ".join(t for (_s, _e, t) in segs).strip()
         text = post_process(raw)
         log(f"call dictation: {clip.size / SAMPLE_RATE:.1f}s -> {len(text)} chars")
@@ -1688,6 +1957,8 @@ def _toggle_call_dictation(via_ui: bool = False) -> None:
             captured_hwnd = 0
             set_state("recording")  # overlay «● Запись» (без эквалайзера — у нас нет своего callback'а)
             log(f"call dictation: START at mic_idx={call_dictation_start_idx}")
+            if SETTINGS.get("sound_notifications_dictation", True):
+                sound.play_start()  # T-355: тот же hotkey Q, та же проблема с незамеченным стартом
         else:
             # Захват foreground на момент стопа (как обычная диктовка)
             captured = 0
@@ -1700,6 +1971,8 @@ def _toggle_call_dictation(via_ui: bool = False) -> None:
             start_idx = call_dictation_start_idx
             call_dictation_start_idx = None
             busy = True
+            if SETTINGS.get("sound_notifications_dictation", True):
+                sound.play_stop()
             set_state("processing")
             threading.Thread(
                 target=_do_call_dictation_thread,
@@ -1718,10 +1991,141 @@ def trigger_call_via_ui() -> None:
     toggle_call_recording()
 
 
+# === T-351: импорт готового аудиофайла ===
+# Декодирование живёт в audio_import (GUI-поток, Qt), транскрипция — здесь, в
+# worker'е окна. Модель берём через load_model() — тот же engine, что у диктовки
+# и созвона, второго WhisperModel в проекте нет (T-259).
+
+# Пауза между сегментами, с которой начинается новый абзац. Длинный файл одной
+# простынёй нечитаем, а сегменты whisper'а — это фразы, не абзацы.
+IMPORT_PARAGRAPH_GAP_SEC = 1.5
+
+
+def begin_file_import() -> bool:
+    """Занять движок под импорт. False — занят записью, созвоном или другим импортом.
+
+    Вызывается из GUI-потока ДО декодирования: смена или выгрузка модели во время
+    импорта — это разрушение WhisperModel после генерации, то есть `0xC0000409`
+    (T-268). Пока флаг стоит, `model_busy()` держит раздел «Модели» закрытым.
+    """
+    global import_busy
+    with state_lock:
+        if model_busy():
+            return False
+        import_busy = True
+    set_state("processing")
+    crashguard.mark("импорт файла: декодирование")
+    return True
+
+
+def end_file_import() -> None:
+    """Освободить движок. Зовётся в `finally` на любом исходе, включая отмену."""
+    global import_busy
+    import_busy = False
+    set_state("idle")
+    crashguard.mark("простой (импорт файла завершён)")
+
+
+def _segments_to_text(segments: list) -> str:
+    """Сегменты (start, end, text) → текст с абзацами по паузам."""
+    parts: list[str] = []
+    prev_end = None
+    for start, end, text in segments:
+        if prev_end is not None and start - prev_end >= IMPORT_PARAGRAPH_GAP_SEC:
+            parts.append("\n\n")
+        elif parts:
+            parts.append(" ")
+        parts.append(text)
+        prev_end = end
+    return "".join(parts).strip()
+
+
+def run_file_import(
+    path: Path,
+    audio_np: np.ndarray,
+    *,
+    progress_cb=None,
+    should_cancel=None,
+) -> dict:
+    """Worker-поток: готовый numpy → текст рядом с исходником.
+
+    Qt-объекты отсюда трогать НЕЛЬЗЯ (T-284) — только `window.notify_*` и
+    переданные колбэки, которые окно доставляет к себе сигналами.
+
+    Язык не задаём (`language=None`) — файл чужой, «ru» тут был бы вредным
+    хардкодом: английская речь распозналась бы как русские звуки. Своя диктовка
+    остаётся на явном «ru».
+    """
+    t0 = time.time()
+    dur_sec = len(audio_np) / SAMPLE_RATE
+    crashguard.mark(f"импорт файла: транскрипция {dur_sec:.0f} сек")
+    # T-404: только из кэша — у импорта своя шкала прогресса по аудио, и
+    # скачивание весов внутри неё выглядело бы как «файл обрабатывается».
+    m = load_model(allow_download=False)
+    info_out: dict = {}
+    segments = transcribe_call.transcribe_channel(
+        m,
+        audio_np,
+        language=None,
+        progress_cb=progress_cb,
+        initial_prompt=INITIAL_PROMPT or None,
+        # Хвостовые правила рассчитаны на одну надиктовку («точка» в конце) —
+        # в сегментах чужого файла они стреляли бы по живой речи (как в созвонах).
+        postproc=lambda text: post_process(text, tail_rules=False),
+        should_cancel=should_cancel,
+        info_out=info_out,
+    )
+    cancelled = bool(should_cancel is not None and should_cancel())
+    text = _segments_to_text(segments)
+    elapsed = time.time() - t0
+    ratio = dur_sec / elapsed if elapsed > 0 else 0.0
+    log(
+        f"file import: {path.name} · {dur_sec:.1f}s audio · {len(text)} chars · "
+        f"{elapsed:.1f}s · {ratio:.1f}x · lang={info_out.get('language', '?')}"
+        + (" · ОТМЕНЁН" if cancelled else "")
+    )
+
+    txt_path = None
+    save_error = ""
+    if text and not cancelled:
+        crashguard.mark("импорт файла: сохраняю txt рядом с исходником")
+        try:
+            candidate = audio_import.output_txt_path(path)
+            candidate.write_text(text, encoding="utf-8")
+            txt_path = candidate
+        except OSError as exc:
+            # Файл может лежать на CD, сетевом диске или в папке без записи —
+            # текст при этом уже есть, и терять его из-за этого нельзя.
+            save_error = str(exc)
+            log(f"file import: txt save fail: {exc}")
+
+    return {
+        "text": text,
+        "txt_path": txt_path,
+        "save_error": save_error,
+        "duration_sec": dur_sec,
+        "elapsed_sec": elapsed,
+        "ratio_x": ratio,
+        "language": info_out.get("language", ""),
+        "cancelled": cancelled,
+        # Пик громкости — чтобы отличить «речь не разобрали» от «дорожка молчит»
+        # (у скринкастов и видео с выключенным микрофоном она почти нулевая).
+        "peak": float(np.abs(audio_np).max()) if audio_np.size else 0.0,
+    }
+
+
+FILE_IMPORT_API = audio_import.FileImportApi(
+    begin=begin_file_import,
+    run=run_file_import,
+    end=end_file_import,
+)
+
+
 # === T-259: смена / первая загрузка модели с видимым прогрессом ===
 def model_busy() -> bool:
-    """Идёт запись или транскрипция (диктовка либо созвон) — модель трогать нельзя."""
-    return bool(recording or busy or call_active or call_busy)
+    """Идёт запись или транскрипция (диктовка, созвон либо импорт файла) —
+    модель трогать нельзя."""
+    return bool(recording or busy or call_active or call_busy or import_busy)
 
 
 class _ModelSwitchBridge(QObject):
@@ -1789,20 +2193,32 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
             log(f"model switched: {done_spec} ({MODEL_DEVICE}/{MODEL_COMPUTE_TYPE})")
             return
         log(f"model switch FAIL ({done_spec}): {error}")
-        # Откат настроек — иначе следующая транскрипция снова упрётся в битую модель.
+        # Откат настроек — иначе следующая транскрипция снова упрётся в битую
+        # модель. T-404: откатываемся ТОЛЬКО на модель, которая реально лежит на
+        # диске и отличается от упавшей. Раньше откат шёл всегда, и на старте с
+        # пустым кэшем (prev == та же несуществующая модель) он запускал вторую
+        # закачку в фоновом потоке — она падала так же и уходила в `_crash.log`.
+        rolled_back = ""
         if prev_settings is not None:
-            SETTINGS["model"] = prev_settings.get("model", engine.FALLBACK_SPEC)
-            SETTINGS["custom_model"] = prev_settings.get("custom_model", "")
-            try:
-                save_settings_dict(SETTINGS)
-            except Exception as exc:
-                log(f"settings rollback save fail: {exc}")
-            threading.Thread(target=load_model, daemon=True, name="model-rollback").start()
+            prev_spec = engine.spec_from_settings(prev_settings)
+            if prev_spec != done_spec and engine.is_cached(prev_spec):
+                SETTINGS["model"] = prev_settings.get("model", engine.FALLBACK_SPEC)
+                SETTINGS["custom_model"] = prev_settings.get("custom_model", "")
+                try:
+                    save_settings_dict(SETTINGS)
+                except Exception as exc:
+                    log(f"settings rollback save fail: {exc}")
+                threading.Thread(
+                    target=lambda: load_model_background(reason="откат на прежнюю модель"),
+                    daemon=True, name="model-rollback",
+                ).start()
+                rolled_back = f"\n\nВернул прежнюю модель ({engine.spec_display(prev_spec)})."
+            else:
+                log(f"откат не нужен: prev={prev_spec} (в кэше: {engine.is_cached(prev_spec)})")
         QMessageBox.warning(
             window,
             "Модель не загрузилась",
-            f"{engine.spec_display(done_spec)} не удалось загрузить:\n\n{error}\n\n"
-            + ("Вернул прежнюю модель." if prev_settings is not None else ""),
+            f"{error}{rolled_back}",
         )
 
     bridge.progress.connect(_on_progress)
@@ -1816,7 +2232,13 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
             switch_model(spec, progress_cb=lambda d, t: bridge.progress.emit(int(d), int(t)))
             bridge.finished.emit(spec, "")
         except Exception as exc:
-            bridge.finished.emit(spec, f"{exc.__class__.__name__}: {exc}")
+            # T-404: у ошибок скачивания есть человеческий текст с причиной и
+            # следующим шагом — показываем его, а не `ClassName: repr`.
+            text = exc.full_text() if isinstance(exc, engine.ModelDownloadError) else (
+                f"{engine.spec_display(spec)} не удалось загрузить:\n\n"
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            bridge.finished.emit(spec, text)
 
     threading.Thread(target=_worker, daemon=True, name="model-switch").start()
 
@@ -1867,7 +2289,10 @@ def start_startup_model() -> None:
     """
     spec = active_model_spec()
     if engine.is_cached(spec):
-        threading.Thread(target=load_model, daemon=True, name="model-preload").start()
+        threading.Thread(
+            target=lambda: load_model_background(reason="прогрев модели на старте"),
+            daemon=True, name="model-preload",
+        ).start()
     else:
         log(f"модель {spec} не найдена на диске — качаю с прогрессом")
         QTimer.singleShot(0, lambda: start_model_switch(spec, dict(SETTINGS)))
@@ -2005,12 +2430,16 @@ def _show_update_offer(info) -> None:
     if _update_box is not None:
         return
     version = updater.version_of(info)
+    # T-328: «что изменилось» перед кнопкой «Обновить». Заметок нет (старый
+    # релиз, фид без них) — окно остаётся ровно таким, каким было до T-328.
+    notes = updater.notes_of(info)
     box = QMessageBox(window)
     box.setWindowTitle("Доступно обновление")
     box.setIcon(QMessageBox.Information)
     box.setText(f"Вышла версия {version}.")
     box.setInformativeText(
-        "Записи, настройки, словарь и скачанные модели останутся на месте."
+        (notes + "\n\n" if notes else "")
+        + "Записи, настройки, словарь и скачанные модели останутся на месте."
     )
     update_btn = box.addButton("Обновить и перезапустить", QMessageBox.AcceptRole)
     box.addButton("Позже", QMessageBox.RejectRole)
@@ -2113,6 +2542,9 @@ class _Bridge(QObject):
             f"{len(_BODY_RULES) + len(_TAIL_RULES)}")
         # Папка созвонов следует за папкой истории.
         transcribe_call.set_history_dir(history_dir())
+        # T-404: маршрут скачивания весов — применяется сразу, без перезапуска:
+        # его правят как раз в момент, когда модель не качается.
+        engine.set_download_proxy(SETTINGS.get("download_proxy", ""), logger=log)
         # T-164: hot-reload pre-roll буфера без перезапуска приложения.
         # OFF→ON: запустить фоновый sd.InputStream. ON→OFF: остановить.
         new_pre_roll = bool(new.get("pre_roll_enabled", False))
@@ -2161,6 +2593,10 @@ class _Bridge(QObject):
                 )
             else:
                 start_model_switch(new_spec, prev_settings)
+
+    @Slot()
+    def on_stop_sound(self) -> None:
+        sound.play_stop()
 
     @Slot()
     def on_quit_requested(self) -> None:
@@ -2319,11 +2755,18 @@ def main() -> None:
     app.setApplicationDisplayName("SayType")
     app.setQuitOnLastWindowClosed(False)  # tray держит процесс живым после close окна
 
+    # T-355: QSoundEffect создаётся здесь (main thread, после QApplication) и живёт
+    # всю сессию — держит audio session процесса "тёплой", короткие редкие сигналы
+    # не обрываются (см. sound.py, история двух неудачных попыток в docstring).
+    sound.init_player()
+
     SETTINGS = load_settings_dict()
     # Словарь и замены — данные пользователя, а не константы кода (T-260).
     reload_user_dictionary()
     # Подпапка созвонов живёт внутри папки истории из настроек.
     transcribe_call.set_history_dir(history_dir())
+    # T-404: свой маршрут для huggingface.co — до первой попытки скачать веса.
+    engine.set_download_proxy(SETTINGS.get("download_proxy", ""), logger=log)
     log(
         f"start · hotkey={SETTINGS['hotkey']} · history={SETTINGS['history_dir']} · "
         f"count={SETTINGS['rotation_count']} · "
@@ -2353,13 +2796,16 @@ def main() -> None:
         entry_script=Path(__file__).resolve(),
         toggle_recording_via_ui=trigger_recording_via_ui,
         toggle_call_via_ui=trigger_call_via_ui,
+        toggle_note_recording_via_ui=trigger_note_recording_via_ui,  # T-352
         model_busy_getter=model_busy,  # T-259: блокировка смены модели во время работы
+        file_import_api=FILE_IMPORT_API,  # T-351: импорт готового аудиофайла
     )
     APP_HWND = int(window.winId())  # hwnd для RegisterHotKey
 
     bridge = _Bridge()
     window.settings_changed.connect(bridge.on_settings_changed)
     window.quit_requested.connect(bridge.on_quit_requested)
+    window.stop_sound_requested.connect(bridge.on_stop_sound)
 
     # T-132: preload модели в фоне — нужна для streaming worker'а с первой записи.
     # OFF-режим грузит лениво при первом стопе (5-7 сек ожидания), preload только

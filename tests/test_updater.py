@@ -79,3 +79,73 @@ def test_broken_feed_raises_on_manual_check(monkeypatch):
 def test_version_of_survives_garbage():
     """Номер версии для текста уведомления не должен ронять UI."""
     assert updater.version_of(object()) == "?"
+
+
+# === T-328: заметки релиза ===
+
+
+class _Info:
+    """UpdateInfo ровно в том объёме, в каком его читает notes_of."""
+
+    def __init__(self, notes):
+        self.TargetFullRelease = type("Asset", (), {"NotesMarkdown": notes})()
+
+
+def test_notes_absent_give_empty_string():
+    """Старый релиз без заметок и мусор вместо UpdateInfo — пусто, не ошибка.
+
+    От этого зависит поведение окна: пустая строка = показать его как до T-328,
+    а исключение здесь уронило бы предложение обновиться целиком.
+    """
+    assert updater.notes_of(object()) == ""
+    assert updater.notes_of(_Info(None)) == ""
+    assert updater.notes_of(_Info("")) == ""
+    assert updater.notes_of(_Info("## 0.3.0\n\n---\n")) == "", "одно оформление — нечего показывать"
+
+
+def test_notes_markdown_becomes_plain_text():
+    notes = updater.notes_of(_Info(
+        "## 0.3.0 — 12 августа\n"
+        "\n"
+        "- Модель переключается **без перезапуска**\n"
+        "- Полный список — [на странице релиза](https://example.com/r)\n"
+    ))
+    assert notes == (
+        "• Модель переключается без перезапуска\n"
+        "• Полный список — на странице релиза"
+    )
+
+
+def test_notes_join_wrapped_lines():
+    """Перенос по ширине в CHANGELOG.md — не новый пункт."""
+    notes = updater.notes_of(_Info(
+        "- Мастер первого запуска спрашивает микрофон, потом\n"
+        "  скачивает выбранную модель\n"
+        "- Вторая строчка\n"
+    ))
+    assert notes.splitlines() == [
+        "• Мастер первого запуска спрашивает микрофон, потом скачивает выбранную модель",
+        "• Вторая строчка",
+    ]
+
+
+def test_notes_drop_markdown_comments():
+    """Служебная пометка из CHANGELOG.md человеку не адресована.
+
+    Поймано живым прогоном T-328: маркер `<!-- ... -->` доехал до окна
+    обновления и встал в списке изменений отдельной строкой.
+    """
+    notes = updater.notes_of(_Info(
+        "<!-- временно, убрать после прогона -->\n"
+        "- Настоящее изменение\n"
+        "<!-- /временно -->\n"
+    ))
+    assert notes == "• Настоящее изменение"
+
+
+def test_notes_are_capped():
+    """Длинный список не должен растягивать окно на весь экран."""
+    notes = updater.notes_of(_Info("\n".join(f"- изменение {i}" for i in range(30))))
+    body, tail = notes.rsplit("\n", 1)
+    assert len(body.splitlines()) == 8
+    assert "и ещё изменения" in tail

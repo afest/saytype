@@ -21,17 +21,19 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from . import audio_import  # T-351: декодер аудиофайла (QAudioDecoder) + контракт импорта
 from . import cuda_layer  # T-261: докачиваемый CUDA-рантайм (строка «Ускорение GPU»)
 from . import engine  # T-259: пресеты моделей, валидация «своей модели», учёт места
 from . import profile  # где лежат настройки, словарь и замены
 from . import updater  # T-262: проверка обновлений через Velopack
 
-from PySide6.QtCore import Qt, QSettings, QUrl, QSize, QMargins, Signal, Slot
+from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, QSize, QMargins, Signal, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -78,6 +80,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
@@ -107,10 +110,25 @@ DEFAULT_AUTO_THRESHOLD_SEC = 10
 DEFAULT_PRE_ROLL_ENABLED = False  # T-164: rolling 500мс ДО hotkey (always-on mic, дефолт OFF)
 DEFAULT_KEEP_CALL_AUDIO = False   # T-174: хранить MP3 созвона (дефолт OFF — нужен только транскрипт)
 DEFAULT_CHECK_UPDATES = True      # T-262: фоновая проверка обновлений (выключаемая в настройках)
+DEFAULT_SOUND_NOTIFICATIONS_DICTATION = True  # T-355: звук старт/стоп надиктовки (Q) — фикс потери текста, дефолт ON
+DEFAULT_SOUND_NOTIFICATIONS_CALL = True        # T-355: звук старт/стоп записи созвона (E) — отдельный чекбокс, дефолт ON
 # T-263: устройство записи. Пусто = системное по умолчанию — так было всегда и
 # так остаётся, пока человек не выберет конкретный микрофон в мастере.
 DEFAULT_MIC_DEVICE = ""
+# T-404: прокси только для скачивания весов. Пусто = как система (WinINET/env).
+DEFAULT_DOWNLOAD_PROXY = ""
 DEFAULT_CALL_AUDIO_KEEP = 2       # T-175: сколько последних WAV созвонов держать в Calls\ (буфер «вернуться»)
+# T-389: hi-fi надиктовка — материал для клона голоса. Записи идут на 44.1/48 кГц
+# в подпапку `profile.HIFI_SUBDIR`, минуя ротацию истории; Whisper получает
+# 16-кГц копию, поэтому распознавание не меняется. Дефолт OFF: обычному
+# пользователю лишние мегабайты и вторая частота не нужны.
+DEFAULT_HIFI_ENABLED = False
+DEFAULT_HIFI_SAMPLE_RATE = 44100
+HIFI_SAMPLE_RATES = (44100, 48000)
+# Ориентир объёма для Professional Voice Clone: 30 минут только формально
+# включают режим, разницу даёт объём ближе к рекомендованному максимуму.
+# Это подпись в настройках, а не условие остановки — режим выключает человек.
+HIFI_TARGET_MINUTES = 180
 # T-259: модель транскрипции. `model` = ключ пресета из engine.PRESETS либо
 # "custom"; при "custom" значение берётся из `custom_model` (HF repo id или путь
 # к папке с CT2-моделью). Для СУЩЕСТВУЮЩИХ настроек (settings.ini уже есть)
@@ -329,6 +347,51 @@ def _draw_chip(p: QPainter, r: QRect, c: QColor) -> None:
         p.drawLine(int(18 * k), int(pos * k), int(21.5 * k), int(pos * k))  # справа
 
 
+def _draw_note_icon(p: QPainter, r: QRect, c: QColor) -> None:
+    """Лист с текстом (T-352, кнопка «Заметки») — рамка + три строки, тот же
+    stroke-стиль 2px, что у остальных иконок шапки."""
+    p.setPen(_mk_pen(c, r.width()))
+    p.setBrush(Qt.NoBrush)
+    s = r.width()
+    k = s / 24.0
+    p.drawRoundedRect(int(5 * k), int(3 * k), int(14 * k), int(18 * k), int(2 * k), int(2 * k))
+    for y in (9, 13, 17):
+        p.drawLine(int(8 * k), int(y * k), int(16 * k), int(y * k))
+
+
+def _draw_heart(p: QPainter, r: QRect, c: QColor) -> None:
+    """Сердце (T-354, кнопка «Поддержать разработку») — контур в том же
+    stroke-стиле 2px, что у остальных иконок шапки, без заливки: залитое
+    читается как «лайк/избранное», а не как «поддержать»."""
+    from PySide6.QtGui import QPainterPath
+
+    p.setPen(_mk_pen(c, r.width()))
+    p.setBrush(Qt.NoBrush)
+    k = r.width() / 24.0
+    path = QPainterPath()
+    path.moveTo(12 * k, 20.5 * k)
+    path.cubicTo(4.5 * k, 14.5 * k, 2.5 * k, 11.5 * k, 2.5 * k, 8.5 * k)
+    path.cubicTo(2.5 * k, 4.5 * k, 8.5 * k, 3.0 * k, 12 * k, 7.5 * k)
+    path.cubicTo(15.5 * k, 3.0 * k, 21.5 * k, 4.5 * k, 21.5 * k, 8.5 * k)
+    path.cubicTo(21.5 * k, 11.5 * k, 19.5 * k, 14.5 * k, 12 * k, 20.5 * k)
+    p.drawPath(path)
+
+
+def _draw_import(p: QPainter, r: QRect, c: QColor) -> None:
+    """Импорт аудиофайла (T-351) — лоток со стрелкой вниз, стиль Lucide
+    download: стрелка входит в открытую «полку». Тот же stroke 2px."""
+    p.setPen(_mk_pen(c, r.width()))
+    p.setBrush(Qt.NoBrush)
+    s = r.width()
+    k = s / 24.0
+    p.drawLine(int(12 * k), int(3 * k), int(12 * k), int(14 * k))       # древко стрелки
+    p.drawLine(int(7.5 * k), int(9.5 * k), int(12 * k), int(14 * k))    # левое перо
+    p.drawLine(int(16.5 * k), int(9.5 * k), int(12 * k), int(14 * k))   # правое перо
+    p.drawLine(int(4 * k), int(17 * k), int(4 * k), int(20 * k))        # левый борт полки
+    p.drawLine(int(4 * k), int(20 * k), int(20 * k), int(20 * k))       # дно
+    p.drawLine(int(20 * k), int(17 * k), int(20 * k), int(20 * k))      # правый борт
+
+
 def _draw_phone(p: QPainter, r: QRect, c: QColor) -> None:
     """Phone handset — упрощённая Lucide phone (stroke 2px, round caps как gear/folder).
     Скруглённая «трубка»: диагональ из левого-верха в правый-низ с расширениями
@@ -384,6 +447,38 @@ def set_call_consent_acknowledged(value: bool = True) -> None:
 
 
 _VALID_PROCESSING_MODES = ("auto", "always_batch", "always_streaming")
+
+
+def _valid_hifi_rate(value) -> int:
+    """Частота hi-fi записи из настроек → одно из HIFI_SAMPLE_RATES."""
+    try:
+        rate = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_HIFI_SAMPLE_RATE
+    return rate if rate in HIFI_SAMPLE_RATES else DEFAULT_HIFI_SAMPLE_RATE
+
+
+def hifi_dir(history_dir: Path) -> Path:
+    """Папка-карантин hi-fi надиктовок внутри папки истории."""
+    return Path(history_dir) / profile.HIFI_SUBDIR
+
+
+def hifi_accumulated_minutes(history_dir: Path) -> float:
+    """Сколько минут hi-fi материала уже накоплено — по факту файлов на диске.
+
+    Считаем каждый раз заново, а не храним счётчик в настройках: удалённые
+    вручную файлы иначе продолжали бы числиться накопленными, и подпись врала бы
+    ровно в тот момент, когда по ней принимают решение «хватит».
+    """
+    from .transcribe_call import _wav_duration_sec  # тяжёлый аудио-слой — только по требованию
+
+    folder = hifi_dir(history_dir)
+    if not folder.exists():
+        return 0.0
+    total_sec = 0.0
+    for wav in folder.glob("*.wav"):
+        total_sec += _wav_duration_sec(wav)
+    return total_sec / 60.0
 
 
 def load_settings_dict() -> dict:
@@ -449,6 +544,10 @@ def load_settings_dict() -> dict:
         "processing_mode": processing_mode,
         "auto_threshold_sec": threshold,
         "pre_roll_enabled": _as_bool(s.value("pre_roll_enabled", DEFAULT_PRE_ROLL_ENABLED)),
+        # T-389: hi-fi надиктовка (частота — только из белого списка: на чужом
+        # значении в ini sd.InputStream упал бы уже на старте записи).
+        "hifi_enabled": _as_bool(s.value("hifi_enabled", DEFAULT_HIFI_ENABLED)),
+        "hifi_sample_rate": _valid_hifi_rate(s.value("hifi_sample_rate", DEFAULT_HIFI_SAMPLE_RATE)),
         "keep_call_audio": _as_bool(s.value("keep_call_audio", DEFAULT_KEEP_CALL_AUDIO)),
         "call_audio_keep": max(1, int(s.value("call_audio_keep", DEFAULT_CALL_AUDIO_KEEP))),
         "speaker_self": s.value("speaker_self", DEFAULT_SPEAKER_SELF, type=str) or DEFAULT_SPEAKER_SELF,
@@ -459,6 +558,13 @@ def load_settings_dict() -> dict:
         "cuda_layer_declined": _as_bool(s.value("cuda_layer_declined", False)),
         # T-262: фоновая проверка обновлений при старте
         "check_updates": _as_bool(s.value("check_updates", DEFAULT_CHECK_UPDATES)),
+        # T-355: звуковой сигнал старт/стоп — раздельные чекбоксы надиктовки и созвона
+        "sound_notifications_dictation": _as_bool(
+            s.value("sound_notifications_dictation", DEFAULT_SOUND_NOTIFICATIONS_DICTATION)
+        ),
+        "sound_notifications_call": _as_bool(
+            s.value("sound_notifications_call", DEFAULT_SOUND_NOTIFICATIONS_CALL)
+        ),
         # T-263: имя устройства записи (пусто — системное) и признак того, что
         # мастер первого запуска уже пройден
         "mic_device": s.value("mic_device", DEFAULT_MIC_DEVICE, type=str) or "",
@@ -467,6 +573,11 @@ def load_settings_dict() -> dict:
         # перевод вынесен в отдельную задачу, а определить язык по локали при
         # первом запуске надо в момент первого запуска, а не задним числом.
         "ui_language": s.value("ui_language", "", type=str) or "",
+        # T-404: через какой прокси качать веса. Пусто — как раньше, по
+        # настройке Windows. Нужно там, где VPN уводит huggingface.co в
+        # маршрут, который его теряет: тогда сюда пишут адрес рабочего
+        # (у Karing это его же direct-порт), и туннель трогать не приходится.
+        "download_proxy": s.value("download_proxy", DEFAULT_DOWNLOAD_PROXY, type=str) or "",
         # Словарь — отдельный файл в профиле, а не значение ini: пользователь
         # правит его руками и делится им, а QSettings экранирует не-ASCII.
         "dictionary": profile.load_dictionary(),
@@ -487,8 +598,11 @@ def save_settings_dict(d: dict) -> None:
     threshold = int(d.get("auto_threshold_sec", DEFAULT_AUTO_THRESHOLD_SEC))
     s.setValue("auto_threshold_sec", max(1, min(60, threshold)))
     s.setValue("pre_roll_enabled", bool(d.get("pre_roll_enabled", DEFAULT_PRE_ROLL_ENABLED)))
+    s.setValue("hifi_enabled", bool(d.get("hifi_enabled", DEFAULT_HIFI_ENABLED)))
+    s.setValue("hifi_sample_rate", _valid_hifi_rate(d.get("hifi_sample_rate", DEFAULT_HIFI_SAMPLE_RATE)))
     s.setValue("keep_call_audio", bool(d.get("keep_call_audio", DEFAULT_KEEP_CALL_AUDIO)))
     s.setValue("call_audio_keep", max(1, int(d.get("call_audio_keep", DEFAULT_CALL_AUDIO_KEEP))))
+    s.setValue("download_proxy", (d.get("download_proxy") or "").strip())
     # T-259: модель + «своя модель» (repo id / путь). Пустой custom при model=custom
     # не сохраняем как custom — откатываем на дефолт, чтобы не получить нерабочий ini.
     model_key = d.get("model", DEFAULT_MODEL_EXISTING)
@@ -506,6 +620,10 @@ def save_settings_dict(d: dict) -> None:
     if "cuda_layer_declined" in d:
         s.setValue("cuda_layer_declined", bool(d["cuda_layer_declined"]))
     s.setValue("check_updates", bool(d.get("check_updates", DEFAULT_CHECK_UPDATES)))
+    s.setValue("sound_notifications_dictation",
+               bool(d.get("sound_notifications_dictation", DEFAULT_SOUND_NOTIFICATIONS_DICTATION)))
+    s.setValue("sound_notifications_call",
+               bool(d.get("sound_notifications_call", DEFAULT_SOUND_NOTIFICATIONS_CALL)))
     if "mic_device" in d:
         s.setValue("mic_device", (d.get("mic_device") or "").strip())
     if "wizard_done" in d:
@@ -1059,6 +1177,20 @@ def hotkey_conflicts_with_handy(hotkey: str) -> bool:
 
 # === О программе ===
 
+# Страница «Поддержать разработку» живёт ВНЕ приложения: за одним стабильным
+# URL меняется набор платёжных способов, и смена сервиса не требует нового
+# билда и релиза (T-354, разбор — docs/донат-сервисы.md в карточке проекта).
+# Формулировка везде «поддержать разработку», а не «купить»/«разблокировать»:
+# донат за уже бесплатную программу — дар, а обещание чего-то взамен делает
+# его выручкой.
+DONATE_URL = "https://afest.github.io/pages/p/donate/"
+
+
+def open_donate_page() -> None:
+    """Открыть страницу поддержки в браузере (из «О программе» и из трея)."""
+    QDesktopServices.openUrl(QUrl(DONATE_URL))
+
+
 # Компоненты под LGPL-3.0, которые едут в поставке. Ссылка ведёт на исходники
 # ИМЕННО ТОЙ версии, что собрана: обязательство LGPL — дать возможность собрать
 # замену конкретной библиотеке, а «последняя версия на сайте» этого не даёт.
@@ -1151,6 +1283,9 @@ class AboutDialog(QDialog):
         layout.addWidget(lgpl)
 
         buttons = QDialogButtonBox()
+        donate_btn = buttons.addButton("Поддержать разработку", QDialogButtonBox.ActionRole)
+        donate_btn.setToolTip(DONATE_URL)
+        donate_btn.clicked.connect(self._open_donate)
         licenses_btn = buttons.addButton("Тексты лицензий", QDialogButtonBox.ActionRole)
         licenses_btn.clicked.connect(self._open_licenses)
         licenses_path = profile.licenses_dir()
@@ -1165,6 +1300,9 @@ class AboutDialog(QDialog):
         path = profile.licenses_dir()
         if path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_donate(self) -> None:
+        open_donate_page()
 
 
 class _EqualizerBars(QWidget):
@@ -1385,6 +1523,38 @@ class StatusOverlay(QWidget):
             self._spinner_timer.stop()
             self._bars_widget.reset()
             self.hide()
+
+    def show_error(self, text: str, seconds: int = 12) -> None:
+        """Красный toast с текстом сбоя (T-404).
+
+        Нужен потому, что окно обычно закрыто, а приложение живёт в
+        трее: сбой скачивания модели раньше был виден только в `_crash.log`.
+        Держим дольше обычного toast'а (12 сек против 2.5) — сообщение читают,
+        а не подтверждают. Полный текст с причиной показывает окно отдельно.
+        """
+        self._dot_anim_timer.stop()
+        self._spinner_timer.stop()
+        self._spinner.hide()
+        self._check.hide()
+        self._bars_widget.hide()
+        self._time.hide()
+        self._sep.hide()
+        self._dot.show()
+        self._dot.setStyleSheet(
+            "color: #DC2626; font-size: 13px; font-weight: bold; background: transparent;"
+        )
+        short = text if len(text) <= 90 else text[:88].rstrip() + "…"
+        self._label.setText(short)
+        self._position_bottom()
+        self.show()
+        self.raise_()
+        QTimer.singleShot(max(1, int(seconds)) * 1000, self._hide_if_error)
+
+    def _hide_if_error(self) -> None:
+        """Скрыть только если за это время не началась запись / транскрипция."""
+        if self._bars_widget.isVisible() or self._spinner.isVisible():
+            return
+        self.hide()
 
     def update_audio_level(self, level: float) -> None:
         if self._bars_widget.isVisible():
@@ -2337,6 +2507,34 @@ class SettingsDialog(QDialog):
             "индикатор в tray."
         )
 
+        # T-389: hi-fi надиктовка — сырьё для клона голоса. Чекбокс + частота;
+        # частота выбирается только при включённом режиме (иначе радио висят
+        # активными и обещают влияние на обычную запись, которого нет).
+        self.hifi_box = QCheckBox()
+        self.hifi_box.setChecked(bool(current.get("hifi_enabled", DEFAULT_HIFI_ENABLED)))
+        self.hifi_box.setToolTip(
+            "Надиктовка пишется в подпапке "
+            f"{profile.HIFI_SUBDIR}\\ на выбранной частоте и не участвует в ротации "
+            "истории — материал копится, пока режим включён. Распознавание не "
+            "меняется: Whisper получает ту же запись, приведённую к 16 кГц. "
+            "Обычная история диктовок в это время не пополняется."
+        )
+
+        current_hifi_rate = _valid_hifi_rate(current.get("hifi_sample_rate", DEFAULT_HIFI_SAMPLE_RATE))
+        self.hifi_rate_44_radio = QRadioButton("44 100 Гц")
+        self.hifi_rate_48_radio = QRadioButton("48 000 Гц")
+        self.hifi_rate_group = QButtonGroup(self)
+        self.hifi_rate_group.addButton(self.hifi_rate_44_radio)
+        self.hifi_rate_group.addButton(self.hifi_rate_48_radio)
+        if current_hifi_rate == 48000:
+            self.hifi_rate_48_radio.setChecked(True)
+        else:
+            self.hifi_rate_44_radio.setChecked(True)
+        self.hifi_rate_44_radio.setEnabled(self.hifi_box.isChecked())
+        self.hifi_rate_48_radio.setEnabled(self.hifi_box.isChecked())
+        self.hifi_box.toggled.connect(self.hifi_rate_44_radio.setEnabled)
+        self.hifi_box.toggled.connect(self.hifi_rate_48_radio.setEnabled)
+
         # T-174: хранить ли аудио (MP3) записанного созвона. Дефолт OFF —
         # обычно нужен только транскрипт, а аудио занимает десятки мегабайт.
         self.keep_call_audio_box = QCheckBox()
@@ -2346,6 +2544,28 @@ class SettingsDialog(QDialog):
             "(L=ты, R=собеседник) в подпапке Calls папки истории, а само аудио "
             "удаляется. Включи, чтобы оставлять MP3 128k рядом с транскриптом. "
             "Нужен ffmpeg в PATH — без него MP3 просто не создаётся."
+        )
+
+        # T-355: звук старт/стоп — два независимых чекбокса (надиктовка / созвон).
+        # Живой кейс: несколько надиктовок по ~минуте подряд, tray-иконка не
+        # подсказала, что запись не началась, текст потерян. Дефолт ON у обоих.
+        # Хоткей надиктовки настраиваемый (в отличие от захардкоженного ctrl+shift+e
+        # у созвона) — подпись берёт текущее значение, а не дефолт "q", иначе после
+        # смены хоткея текст в Настройках начинает врать (T-355: живой баг —
+        # хоткей стоял <ctrl>+<shift>+0, подпись всё ещё показывала Q).
+        _hotkey_display = QKeySequence(hotkey_to_qt(current["hotkey"])).toString() or current["hotkey"]
+        self.sound_dictation_box = QCheckBox()
+        self.sound_dictation_box.setChecked(bool(current.get("sound_notifications_dictation", True)))
+        self.sound_dictation_box.setToolTip(
+            f"Короткий звук при старте надиктовки ({_hotkey_display}, в т.ч. во время "
+            "созвона) и другой (ниже тоном) при остановке."
+        )
+
+        self.sound_call_box = QCheckBox()
+        self.sound_call_box.setChecked(bool(current.get("sound_notifications_call", True)))
+        self.sound_call_box.setToolTip(
+            "Короткий звук при старте записи созвона (ctrl+shift+E) и другой "
+            "(ниже тоном) при остановке."
         )
 
         # T-262: автопроверка обновлений. Выключаемая сознательно — часть
@@ -2614,9 +2834,66 @@ class SettingsDialog(QDialog):
         checks_lay.addWidget(_make_check_row(self.autostart_box, "Автостарт с Windows", "(shell:startup)"))
         checks_lay.addWidget(_make_check_row(self.startmin_box, "Запускать свёрнутым в tray", "(без открытого окна)"))
         checks_lay.addWidget(_make_check_row(self.preroll_box, "Pre-roll буфер (500мс ДО hotkey)", "(всегда-on микрофон, устраняет потерю первых слов)"))
+        checks_lay.addWidget(_make_check_row(self.hifi_box, "Hi-fi диктовка (материал для клона голоса)", f"(в {profile.HIFI_SUBDIR}\\, без ротации; распознавание не меняется)"))
         checks_lay.addWidget(_make_check_row(self.keep_call_audio_box, "Хранить аудио созвона (MP3)", "(по умолч. только транскрипт в Calls\\)"))
         checks_lay.addWidget(_make_check_row(self.updates_box, "Проверять обновления автоматически", "(выключено — приложение не выходит в сеть само)"))
+        checks_lay.addWidget(_make_check_row(self.sound_dictation_box, "Звуковой сигнал старт/стоп надиктовки", f"({_hotkey_display}, разные тона)"))
+        checks_lay.addWidget(_make_check_row(self.sound_call_box, "Звуковой сигнал старт/стоп записи созвона", "(ctrl+shift+E, разные тона)"))
         body_v.addLayout(checks_lay)
+
+        # frow_hifi: частота hi-fi записи + сколько материала уже накоплено (T-389).
+        # Счётчик считается по файлам на диске при каждом открытии настроек —
+        # человек сам решает, когда объёма хватит, и сам выключает режим.
+        ghf = _QGrid()
+        ghf.setContentsMargins(0, 0, 0, 0)
+        ghf.setHorizontalSpacing(8)
+        ghf.setVerticalSpacing(6)
+        ghf.setColumnMinimumWidth(0, 150)
+        ghf.setColumnStretch(1, 1)
+        lbl_hifi = QLabel("Частота hi-fi:")
+        lbl_hifi.setObjectName("frow_label")
+        ghf.addWidget(lbl_hifi, 0, 0)
+        hifi_rates_row = QWidget()
+        hifi_rates_row.setStyleSheet("background: transparent;")
+        hifi_rates_lay = QHBoxLayout(hifi_rates_row)
+        hifi_rates_lay.setContentsMargins(0, 0, 0, 0)
+        hifi_rates_lay.setSpacing(16)
+        hifi_rates_lay.addWidget(self.hifi_rate_44_radio)
+        hifi_rates_lay.addWidget(self.hifi_rate_48_radio)
+        hifi_rates_lay.addStretch()
+        ghf.addWidget(hifi_rates_row, 0, 1)
+        self.hifi_counter = QLabel(self._hifi_counter_text(current.get("history_dir", DEFAULT_HISTORY_DIR)))
+        self.hifi_counter.setObjectName("frow_hint")
+        self.hifi_counter.setWordWrap(True)
+        ghf.addWidget(self.hifi_counter, 1, 1)
+        body_v.addLayout(ghf)
+
+        # frow_proxy: прокси только для скачивания весов (T-404). Отдельное поле,
+        # потому что «обход системного прокси» проблему не решает: VPN-туннель
+        # перехватывает трафик по IP, и запрос всё равно уходит через ту же ноду,
+        # которая теряет huggingface.co. Помогает только явный рабочий адрес.
+        gpx = _QGrid()
+        gpx.setContentsMargins(0, 8, 0, 0)
+        gpx.setHorizontalSpacing(8)
+        gpx.setVerticalSpacing(4)
+        gpx.setColumnMinimumWidth(0, 150)
+        gpx.setColumnStretch(1, 1)
+        lbl_proxy = QLabel("Прокси загрузки:")
+        lbl_proxy.setObjectName("frow_label")
+        gpx.addWidget(lbl_proxy, 0, 0)
+        self.proxy_edit = QLineEdit(current.get("download_proxy", DEFAULT_DOWNLOAD_PROXY))
+        self.proxy_edit.setObjectName("settings_input_mono")
+        self.proxy_edit.setPlaceholderText("пусто — как настроено в Windows")
+        gpx.addWidget(self.proxy_edit, 0, 1)
+        proxy_hint = QLabel(
+            "Только для скачивания моделей с huggingface.co. Заполняй, если VPN "
+            "уводит huggingface.co в маршрут, который его теряет: остальные сайты "
+            "работают, а модель не качается. Формат — http://127.0.0.1:3065."
+        )
+        proxy_hint.setObjectName("frow_hint")
+        proxy_hint.setWordWrap(True)
+        gpx.addWidget(proxy_hint, 1, 1)
+        body_v.addLayout(gpx)
 
         # frow_version: версия + ручная проверка обновлений (T-262).
         # Ручная проверка живёт рядом с галкой автопроверки, но работает и при
@@ -2773,6 +3050,22 @@ class SettingsDialog(QDialog):
             tail = ""
         self.dict_counter.setText(f"{n} / {budget} токенов{suffix}{tail}")
 
+    def _hifi_counter_text(self, history_dir: str) -> str:
+        """«Накоплено N из 180 мин» — по факту WAV в папке-карантине (T-389).
+
+        Чтение диска в конструкторе диалога: файлов там десятки, а `wave` читает
+        только заголовок. Битый или недописанный файл даёт 0 секунд и не роняет
+        настройки.
+        """
+        try:
+            minutes = hifi_accumulated_minutes(Path(history_dir))
+        except Exception:
+            return f"Накоплено: не удалось прочитать {profile.HIFI_SUBDIR}\\"
+        return (
+            f"Накоплено: {minutes:.0f} из {HIFI_TARGET_MINUTES} мин в {profile.HIFI_SUBDIR}\\ — "
+            "ориентир для клона голоса. Сам режим не выключится, это делаешь ты."
+        )
+
     def _update_repl_label(self) -> None:
         n = len(self._replacement_rules)
         if not n:
@@ -2849,10 +3142,12 @@ class SettingsDialog(QDialog):
             return
         version = updater.version_of(info)
         self.update_hint.setText(f"Доступна версия {version}.")
+        notes = updater.notes_of(info)  # T-328: пусто — текст как до T-328
         answer = QMessageBox.question(
             self, "Доступно обновление",
             f"Версия {version} готова к установке.\n\n"
-            "Скачать и перезапустить приложение? Записи, настройки и скачанные "
+            + (notes + "\n\n" if notes else "")
+            + "Скачать и перезапустить приложение? Записи, настройки и скачанные "
             "модели останутся на месте.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
@@ -2956,6 +3251,9 @@ class SettingsDialog(QDialog):
             "processing_mode": mode,
             "auto_threshold_sec": int(self.threshold_spin.value()),
             "pre_roll_enabled": bool(self.preroll_box.isChecked()),
+            # T-389: hi-fi надиктовка + её частота
+            "hifi_enabled": bool(self.hifi_box.isChecked()),
+            "hifi_sample_rate": 48000 if self.hifi_rate_48_radio.isChecked() else 44100,
             "keep_call_audio": bool(self.keep_call_audio_box.isChecked()),
             "call_audio_keep": int(self.call_keep_spin.value()),
             "dictionary": self.dict_edit.toPlainText().strip(),
@@ -2965,6 +3263,9 @@ class SettingsDialog(QDialog):
             # старт снова считал бы, что от ускорения отказались навсегда.
             "cuda_layer_declined": False if self._cuda_requested else self._cuda_declined,
             "check_updates": bool(self.updates_box.isChecked()),
+            "sound_notifications_dictation": bool(self.sound_dictation_box.isChecked()),
+            "sound_notifications_call": bool(self.sound_call_box.isChecked()),
+            "download_proxy": self.proxy_edit.text().strip(),  # T-404
         }
 
     def replacement_rules(self) -> "list | None":
@@ -4072,10 +4373,749 @@ class _CallTranscriptDialog(QDialog):
         QTimer.singleShot(1800, lambda: self._copy_btn.setText("Скопировать"))
 
 
+# === T-351: импорт аудиофайла ===
+
+
+class FileImportDialog(QDialog):
+    """Прогресс импорта: декодирование в GUI-потоке → транскрипция в worker'е.
+
+    Порядок именно такой (R2 из T-350): ``QAudioDecoder`` — Qt-объект и обязан
+    жить в главном потоке, а ``model.transcribe`` — многоминутная работа и обязан
+    из него уйти. Оркестрация запускается через ``singleShot(0)`` уже внутри
+    ``exec()``: до этого момента диалога на экране нет, и декодирование шло бы
+    в невидимое окно.
+
+    Отмена дешёвая на обоих этапах: декодер останавливается между буферами,
+    ``segments`` faster-whisper — ленивый генератор, выход из цикла прекращает
+    работу (иначе часовой файл на CPU нечем было бы прервать, R4).
+    """
+
+    _transcribe_progress = Signal(float, float)   # done_sec, total_sec
+    _transcribe_finished = Signal(object, str)    # result dict | None, error text
+
+    def __init__(self, parent: QWidget | None, path: Path, api) -> None:
+        super().__init__(parent)
+        self._path = Path(path)
+        self._api = api
+        self._cancelled = False
+        self._engine_taken = False
+        self.result_data: "dict | None" = None
+        self.error_text: str = ""
+
+        self.setWindowTitle("Расшифровка файла")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.setStyleSheet(BASE_DIALOG_QSS)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(10)
+
+        name = QLabel(self._path.name)
+        name.setStyleSheet("font-size: 14px; font-weight: 600;")
+        name.setWordWrap(True)
+        lay.addWidget(name)
+
+        self._stage = QLabel("Читаю файл…")
+        self._stage.setObjectName("frow_hint")
+        lay.addWidget(self._stage)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._bar.setStyleSheet(
+            "QProgressBar { background: #E4E4E7; border: none; border-radius: 3px; }"
+            "QProgressBar::chunk { background: #18181B; border-radius: 3px; }"
+        )
+        lay.addWidget(self._bar)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self._cancel_btn = QPushButton("Отмена")
+        self._cancel_btn.setObjectName("btn_outline")
+        self._cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        row.addWidget(self._cancel_btn)
+        lay.addLayout(row)
+
+        self._transcribe_progress.connect(self._on_transcribe_progress)
+        self._transcribe_finished.connect(self._on_transcribe_finished)
+        QTimer.singleShot(0, self._start)
+
+    # --- шаги ---
+
+    def _start(self) -> None:
+        if not self._api.begin():
+            self.error_text = (
+                "Движок сейчас занят — идёт запись, созвон или другой импорт. "
+                "Дождитесь окончания и попробуйте снова."
+            )
+            self.reject()
+            return
+        self._engine_taken = True
+        try:
+            audio = audio_import.decode_audio_file(
+                self._path,
+                progress_cb=self._on_decode_progress,
+                should_cancel=lambda: self._cancelled,
+            )
+        except audio_import.AudioImportCancelled:
+            self._finish_engine()
+            self.reject()
+            return
+        except audio_import.AudioImportError as exc:
+            self.error_text = str(exc)
+            self._finish_engine()
+            self.reject()
+            return
+        except Exception as exc:  # неожиданный сбой Qt-декодера — тоже показать, а не проглотить
+            self.error_text = f"Не удалось прочитать файл: {exc}"
+            self._finish_engine()
+            self.reject()
+            return
+
+        dur = audio.size / audio_import.SAMPLE_RATE
+        self._stage.setText(f"Распознаю речь… ({dur / 60:.1f} мин аудио)")
+        self._bar.setValue(0)
+        threading.Thread(
+            target=self._transcribe_worker, args=(audio,),
+            daemon=True, name="file-import",
+        ).start()
+
+    def _transcribe_worker(self, audio) -> None:
+        """Worker-поток: к Qt отсюда — только через сигналы (T-284)."""
+        try:
+            data = self._api.run(
+                self._path,
+                audio,
+                progress_cb=lambda done, total: self._transcribe_progress.emit(
+                    float(done), float(total)
+                ),
+                should_cancel=lambda: self._cancelled,
+            )
+            self._transcribe_finished.emit(data, "")
+        except Exception as exc:
+            self._transcribe_finished.emit(None, f"Ошибка распознавания: {exc}")
+
+    # --- прогресс / финал ---
+
+    def _on_decode_progress(self, done_sec: float, total_sec: float) -> None:
+        if total_sec > 0:
+            self._bar.setValue(max(0, min(100, int(done_sec * 100 / total_sec))))
+            self._stage.setText(f"Читаю файл… {done_sec / 60:.1f} из {total_sec / 60:.1f} мин")
+        else:
+            self._stage.setText(f"Читаю файл… {done_sec / 60:.1f} мин")
+
+    @Slot(float, float)
+    def _on_transcribe_progress(self, done_sec: float, total_sec: float) -> None:
+        if total_sec > 0:
+            self._bar.setValue(max(0, min(100, int(done_sec * 100 / total_sec))))
+
+    @Slot(object, str)
+    def _on_transcribe_finished(self, data, error: str) -> None:
+        self._finish_engine()
+        if error:
+            self.error_text = error
+            self.reject()
+            return
+        if data is None or data.get("cancelled"):
+            self.reject()
+            return
+        self.result_data = data
+        self.accept()
+
+    def _on_cancel(self) -> None:
+        self._cancelled = True
+        self._cancel_btn.setEnabled(False)
+        self._stage.setText("Останавливаю…")
+
+    def _finish_engine(self) -> None:
+        if self._engine_taken:
+            self._engine_taken = False
+            try:
+                self._api.end()
+            except Exception:
+                pass
+
+    def reject(self) -> None:
+        """Esc и крестик = «Отмена», а не мгновенное закрытие.
+
+        Диалог обязан дожить до момента, когда движок отпущен: закройся он
+        раньше — `import_busy` остался бы висеть, и раздел «Модели» был бы
+        заблокирован до перезапуска приложения. Крестик приходит сюда же:
+        `QDialog.closeEvent` по умолчанию зовёт `reject()`.
+        """
+        if self._engine_taken:
+            self._on_cancel()
+            return
+        super().reject()
+
+
+# === T-352: раздел «Заметки» ===
+# Заметка живёт в profile.py как отдельный .md-файл (profile.notes_dir()), вне
+# ротируемой истории — противоположная семантика: «последние N, потом
+# сотрётся» vs «пока не удалю сам» (T-350, открытый продуктовый вопрос №1,
+# решён владельцем продукта в пользу отдельного раздела по кнопке в шапке).
+#
+# UI-правка (2026-08-10, по отзыву после живого прогона): раньше список и редактор
+# были двумя отдельными модальными QDialog (клик по карточке открывал новое
+# окно). Теперь один экран сплит-вью 30/70 — список слева узкой колонкой
+# (заголовок сокращается многоточием, полностью помещаться не обязан),
+# редактор справа встроен и переключается по клику, без открытия окна.
+# `NoteEditorPanel` — не QDialog, а обычный QWidget: единственный экземпляр на
+# сессию `NotesDialog`, `load()` переключает его на другую заметку.
+
+NOTES_DIALOG_QSS = (
+    BASE_DIALOG_QSS
+    + " QFrame#note_row { background: #FFFFFF; border: 1px solid #E7E7EA; border-radius: 8px; }"
+      " QFrame#note_row:hover { border-color: #D4D4D8; background: #FBFBFC; }"
+      " QFrame#note_row[active=\"true\"] { border-color: #18181B; background: #FBFBFC; }"
+      " QFrame#note_row[active=\"true\"]:hover { border-color: #18181B; }"
+      " QScrollArea { background: transparent; border: none; }"
+      " QWidget#notes_scroll_body { background: transparent; }"
+      " QSplitter::handle { background: #E7E7EA; }"
+      " QSplitter::handle:horizontal { width: 1px; }"
+)
+
+NOTE_TITLE_LIMIT = 22  # узкая колонка (30%) — сокращаем многоточием, а не переносим
+NOTE_SOURCE_NAME_LIMIT = 18  # имя исходного файла в строке источника, до даты
+# Пик громкости, ниже которого считаем дорожку беззвучной. 0.04 — измеренный пик
+# скринкаста, записанного без микрофона; речь даёт заметно больше.
+QUIET_TRACK_PEAK = 0.05
+
+
+def _elide_note_title(title: str) -> str:
+    title = (title or "").strip() or "Без названия"
+    if len(title) <= NOTE_TITLE_LIMIT:
+        return title
+    return title[: NOTE_TITLE_LIMIT - 1].rstrip() + "…"
+
+
+# T-351: откуда взялся текст — значок и подпись в строке списка. Заметка «из
+# файла» и заметка «наговорил» через месяц выглядят одинаково, если не пометить.
+NOTE_SOURCE_BADGES = {
+    profile.NOTE_SOURCE_DICTATION: ("🎙", "надиктовано"),
+    profile.NOTE_SOURCE_IMPORT: ("📁", "из файла"),
+    profile.NOTE_SOURCE_MANUAL: ("✎", "вручную"),
+}
+
+
+class NoteRow(QFrame):
+    """Строка заметки в левой колонке: заголовок в одну строку с сокращением
+    (не важно, помещается ли целиком), метка источника и дата. Подсвечивается
+    тёмной рамкой, когда именно эта заметка сейчас открыта в редакторе справа."""
+
+    open_requested = Signal(Path)
+    delete_requested = Signal(Path)
+
+    def __init__(self, info: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.path: Path = info["path"]
+        self._active = False
+        self.setObjectName("note_row")
+        self.setCursor(Qt.PointingHandCursor)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 6, 8)
+        root.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setSpacing(2)
+        title = QLabel(_elide_note_title(info["title"]))
+        title.setToolTip((info["title"] or "").strip() or "Без названия")
+        title.setStyleSheet("font-size: 13px; font-weight: 600; color: #18181B; background: transparent;")
+        top.addWidget(title, 1)
+        del_btn = QPushButton("✕")
+        del_btn.setObjectName("icon_btn")
+        del_btn.setToolTip("Удалить заметку")
+        del_btn.setCursor(Qt.PointingHandCursor)
+        del_btn.clicked.connect(lambda: self.delete_requested.emit(self.path))
+        top.addWidget(del_btn)
+        root.addLayout(top)
+
+        icon, label = NOTE_SOURCE_BADGES.get(
+            info.get("source", profile.NOTE_SOURCE_MANUAL),
+            NOTE_SOURCE_BADGES[profile.NOTE_SOURCE_MANUAL],
+        )
+        source_name = (info.get("source_name") or "").strip()
+        # Имя файла сокращаем сами, а не всю строку: дата стоит в конце и должна
+        # остаться видимой в узкой колонке.
+        shown = source_name or label
+        if len(shown) > NOTE_SOURCE_NAME_LIMIT:
+            shown = shown[: NOTE_SOURCE_NAME_LIMIT - 1].rstrip() + "…"
+        when_text = datetime.fromtimestamp(info["mtime"]).strftime("%d.%m %H:%M")
+        when = QLabel(f"{icon} {shown} · {when_text}")
+        when.setToolTip(f"{label}: {source_name}" if source_name else label)
+        when.setStyleSheet("font-size: 11px; color: #A1A1AA; background: transparent;")
+        when.setMinimumWidth(0)
+        root.addWidget(when)
+
+    def mousePressEvent(self, ev) -> None:  # noqa: N802
+        super().mousePressEvent(ev)
+        self.open_requested.emit(self.path)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self.setProperty("active", "true" if active else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class NoteEditorPanel(QWidget):
+    """Правая часть раздела «Заметки» (70%) — редактор текущей заметки.
+
+    Один экземпляр на весь `NotesDialog`: клик по строке слева не открывает
+    окно, а переключает содержимое через `load()`. Автосейв (R8, T-350):
+    `hard_exit()` завершает процесс через `TerminateProcess`, `closeEvent`
+    может не выполниться — поэтому пишем на диск по таймеру после каждой
+    правки, а не только при переключении/закрытии.
+    """
+
+    source_changed = Signal()          # T-351: метка источника заметки поменялась
+    file_dropped = Signal(Path)        # T-351: аудиофайл брошен в правую панель
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        toggle_note_recording_via_ui: "Callable[[], None] | None" = None,
+        model_busy_getter: "Callable[[], bool] | None" = None,
+        register_dictation_target: "Callable[[object], None] | None" = None,
+        accept_file_drop: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.path: "Path | None" = None
+        self._toggle_note_recording_via_ui = toggle_note_recording_via_ui
+        self._model_busy_getter = model_busy_getter
+        self._register_dictation_target = register_dictation_target
+        self._recording = False
+        self._accept_file_drop = accept_file_drop
+        self._drop_highlight = False
+        self.setObjectName("note_editor_panel")
+        # Без этого QWidget игнорирует border/background из QSS — подсветка
+        # перетаскивания просто не рисовалась бы.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        if accept_file_drop:
+            self.setAcceptDrops(True)
+
+        from PySide6.QtCore import QTimer
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(800)  # дебаунс — не пишем на диск на каждый символ
+        self._save_timer.timeout.connect(self._save_now)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 20, 24, 16)
+        root.setSpacing(10)
+
+        self.edit = QPlainTextEdit()
+        self.edit.setPlaceholderText(
+            "Выбери заметку слева, нажми «+ Новая заметка»\n"
+            "или перетащи сюда аудио- или видеофайл — он расшифруется в новую заметку\n"
+            "(из видео берётся звуковая дорожка)."
+            if accept_file_drop
+            else "Выбери заметку слева или нажми «+ Новая заметка»."
+        )
+        self.edit.setEnabled(False)
+        # Бросок долетает до панели, а не тонет в текстовом поле (у него свой
+        # обработчик drop'а — он вставил бы в текст путь к файлу строкой).
+        self.edit.setAcceptDrops(False)
+        self.edit.setStyleSheet(
+            "QPlainTextEdit {"
+            " background: #FFFFFF; border: 1px solid #E7E7EA; border-radius: 8px;"
+            " padding: 10px; font-size: 13.5px; color: #18181B;"
+            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
+            "}"
+            " QPlainTextEdit:focus { border-color: #18181B; }"
+            " QPlainTextEdit:disabled { background: #FAFAFA; color: #A1A1AA; }"
+        )
+        self.edit.textChanged.connect(self._on_text_changed)
+        root.addWidget(self.edit, 1)
+
+        self._drop_hint = QLabel("Отпусти файл — расшифрую его в новую заметку")
+        self._drop_hint.setAlignment(Qt.AlignCenter)
+        self._drop_hint.setStyleSheet(
+            "font-size: 13px; font-weight: 600; color: #18181B;"
+            " background: transparent; border: none;"
+        )
+        self._drop_hint.setVisible(False)
+        root.addWidget(self._drop_hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self.dictate_btn = QPushButton("🎙 Диктовать")
+        self.dictate_btn.setObjectName("btn_outline")
+        self.dictate_btn.setCursor(Qt.PointingHandCursor)
+        self.dictate_btn.setEnabled(False)  # включится в load(), когда есть куда писать
+        self.dictate_btn.clicked.connect(self._on_dictate_clicked)
+        btn_row.addWidget(self.dictate_btn)
+        btn_row.addStretch()
+        self.copy_btn = QPushButton("Копировать")
+        self.copy_btn.setObjectName("btn_outline")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self._copy)
+        btn_row.addWidget(self.copy_btn)
+        root.addLayout(btn_row)
+
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def _on_text_changed(self) -> None:
+        if self.path is not None:  # игнорируем programmatic setPlainText() при load()/clear()
+            self._save_timer.start()
+
+    def load(self, path: Path) -> None:
+        """Сохранить текущую заметку (если правки не долетели до диска) и
+        переключиться на другую — без открытия окна."""
+        self.save_now_if_dirty()
+        self.path = path
+        self.edit.blockSignals(True)
+        self.edit.setPlainText(profile.read_note(path))
+        self.edit.blockSignals(False)
+        self.edit.setEnabled(True)
+        self.dictate_btn.setEnabled(self._toggle_note_recording_via_ui is not None)
+        self.copy_btn.setEnabled(True)
+        cursor = self.edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.edit.setTextCursor(cursor)
+        self.edit.setFocus()
+
+    def clear(self) -> None:
+        """Заметка удалена или список пуст — вернуть панель в пустое состояние
+        БЕЗ автосейва (иначе допишем в уже удалённый файл)."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        self.path = None
+        self.edit.blockSignals(True)
+        self.edit.setPlainText("")
+        self.edit.blockSignals(False)
+        self.edit.setEnabled(False)
+        self.dictate_btn.setEnabled(False)
+        self.copy_btn.setEnabled(False)
+
+    def save_now_if_dirty(self) -> None:
+        if self.path is not None and self._save_timer.isActive():
+            self._save_now()
+
+    def _on_dictate_clicked(self) -> None:
+        if self._toggle_note_recording_via_ui is None or self.path is None:
+            return
+        if not self._recording:
+            if self._model_busy_getter is not None:
+                try:
+                    busy = bool(self._model_busy_getter())
+                except Exception:
+                    busy = False
+                if busy:
+                    QMessageBox.information(
+                        self, "Занято", "Идёт другая запись или транскрипция — дождись конца."
+                    )
+                    return
+            self._recording = True
+            self.dictate_btn.setText("⏹ Остановить")
+            if self._register_dictation_target is not None:
+                self._register_dictation_target(self)
+            self._toggle_note_recording_via_ui()
+        else:
+            self._recording = False
+            self.dictate_btn.setEnabled(False)
+            self.dictate_btn.setText("Распознаю…")
+            self._toggle_note_recording_via_ui()
+
+    def note_dictation_ended(self) -> None:
+        """Диктовка завершилась — с текстом или без (пустая запись, исключение
+        в транскрипции). Сброс состояния кнопки одинаков в обоих случаях, чтобы
+        она не залипала на «Распознаю…» на исходах без текста."""
+        self._recording = False
+        self.dictate_btn.setEnabled(self.path is not None)
+        self.dictate_btn.setText("🎙 Диктовать")
+
+    def append_dictation_text(self, text: str) -> None:
+        """Вызывается MainWindow из notify_note_text — main thread, T-284."""
+        self.note_dictation_ended()
+        if not text or self.path is None:
+            return
+        was_empty = not self.edit.toPlainText().strip()
+        cursor = self.edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        prefix = "" if was_empty else "\n"
+        cursor.insertText(prefix + text)
+        self._save_now()
+        # T-351: заметка, начатая голосом, помечается «надиктовано». Если текст
+        # уже был (дописали к расшифровке или к своей записи) — метку источника
+        # не переписываем: она про происхождение материала, а не про последнее
+        # действие.
+        if was_empty:
+            meta = profile.read_note_meta(self.path)
+            if meta["source"] == profile.NOTE_SOURCE_MANUAL:
+                profile.write_note_meta(self.path, source=profile.NOTE_SOURCE_DICTATION)
+                self.source_changed.emit()
+
+    # --- перетаскивание аудиофайла прямо в редактор (T-351) ---
+
+    def dragEnterEvent(self, ev) -> None:  # noqa: N802
+        if self._accept_file_drop and MainWindow._dragged_audio_path(ev) is not None:
+            ev.acceptProposedAction()
+            self._set_drop_highlight(True)
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev) -> None:  # noqa: N802
+        self.dragEnterEvent(ev)
+
+    def dragLeaveEvent(self, ev) -> None:  # noqa: N802
+        self._set_drop_highlight(False)
+        super().dragLeaveEvent(ev)
+
+    def dropEvent(self, ev) -> None:  # noqa: N802
+        self._set_drop_highlight(False)
+        path = MainWindow._dragged_audio_path(ev) if self._accept_file_drop else None
+        if path is None:
+            ev.ignore()
+            return
+        ev.acceptProposedAction()
+        self.file_dropped.emit(path)
+
+    def _set_drop_highlight(self, active: bool) -> None:
+        """Панель принимает файл по всей площади — без отклика это невидимо, и
+        человек не понимает, что бросать можно сюда."""
+        if active == self._drop_highlight:
+            return
+        self._drop_highlight = active
+        # Селектор по objectName — иначе пунктир достаётся и кнопкам внутри.
+        self.setStyleSheet(
+            "QWidget#note_editor_panel {"
+            " background: #F4F4F5; border: 2px dashed #18181B; border-radius: 10px; }"
+            if active else ""
+        )
+        self._drop_hint.setVisible(active)
+
+    def _copy(self) -> None:
+        from PySide6.QtCore import QTimer
+        QApplication.clipboard().setText(self.edit.toPlainText())
+        self.copy_btn.setText("Скопировано ✓")
+        QTimer.singleShot(1800, lambda: self.copy_btn.setText("Копировать"))
+
+    def _save_now(self) -> None:
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        if self.path is not None:
+            profile.write_note(self.path, self.edit.toPlainText())
+
+
+class NotesDialog(QDialog):
+    """Раздел «Заметки» — сплит-вью 30/70: список слева, редактор справа.
+
+    Клик по строке слева переключает `NoteEditorPanel` без открытия окна;
+    «+ Новая заметка» всегда видна над списком (не только в конце скролла).
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        toggle_note_recording_via_ui: "Callable[[], None] | None" = None,
+        model_busy_getter: "Callable[[], bool] | None" = None,
+        register_dictation_target: "Callable[[object], None] | None" = None,
+        import_file_to_note: "Callable[[Path], Path | None] | None" = None,
+        select: "Path | None" = None,
+    ) -> None:
+        super().__init__(parent)
+        self._toggle_note_recording_via_ui = toggle_note_recording_via_ui
+        self._model_busy_getter = model_busy_getter
+        self._register_dictation_target = register_dictation_target
+        self._import_file_to_note = import_file_to_note  # T-351
+        self._rows: dict[Path, NoteRow] = {}
+        self._active_path: "Path | None" = None
+
+        self.setWindowTitle("Заметки")
+        self.setMinimumSize(760, 540)
+        self.setStyleSheet(NOTES_DIALOG_QSS)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        head = QWidget()
+        head_row = QHBoxLayout(head)
+        head_row.setContentsMargins(24, 20, 24, 8)
+        head_row.setSpacing(10)
+        head_v = QVBoxLayout()
+        head_v.setSpacing(4)
+        h1 = QLabel("Заметки")
+        h1.setStyleSheet("font-size: 17px; font-weight: 600; color: #18181B; background: transparent;")
+        head_v.addWidget(h1)
+        sub = QLabel(
+            "Надиктовал или загрузил запись — текст остаётся здесь для правки, "
+            "не улетает в другое окно. Файл можно и аудио, и видео."
+        )
+        sub.setObjectName("frow_hint")
+        sub.setWordWrap(True)
+        head_v.addWidget(sub)
+        head_row.addLayout(head_v, 1)
+        close_btn = QPushButton("Готово")
+        close_btn.setObjectName("btn_primary")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        head_row.addWidget(close_btn, 0, Qt.AlignTop)
+        root.addWidget(head)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
+
+        left = QWidget()
+        left_v = QVBoxLayout(left)
+        left_v.setContentsMargins(20, 8, 12, 16)
+        left_v.setSpacing(8)
+        new_btn = QPushButton("+ Новая заметка")
+        new_btn.setObjectName("btn_outline")
+        new_btn.setCursor(Qt.PointingHandCursor)
+        new_btn.clicked.connect(self._new_note)
+        left_v.addWidget(new_btn)  # всегда сверху, до скролла — не теряется в длинном списке
+        if import_file_to_note is not None:
+            import_btn = QPushButton("⤓ Расшифровать файл")
+            import_btn.setObjectName("btn_outline")
+            import_btn.setCursor(Qt.PointingHandCursor)
+            import_btn.setToolTip(
+            "Выбрать аудио- или видеофайл — или просто перетащить его в правую часть окна"
+        )
+            import_btn.clicked.connect(self._import_note)
+            left_v.addWidget(import_btn)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        left_v.addWidget(self._scroll, 1)
+        splitter.addWidget(left)
+
+        self._editor = NoteEditorPanel(
+            splitter,
+            toggle_note_recording_via_ui=toggle_note_recording_via_ui,
+            model_busy_getter=model_busy_getter,
+            register_dictation_target=register_dictation_target,
+            accept_file_drop=import_file_to_note is not None,
+        )
+        self._editor.source_changed.connect(self._rebuild)
+        self._editor.file_dropped.connect(self._import_dropped_file)
+        splitter.addWidget(self._editor)
+
+        splitter.setStretchFactor(0, 3)  # 30 —
+        splitter.setStretchFactor(1, 7)  # 70 — редактор
+        splitter.setSizes([228, 532])
+
+        if select is not None and select.exists():
+            self._active_path = select
+        self._rebuild()
+        if self._active_path is not None:
+            self._editor.load(self._active_path)
+
+    def _rebuild(self) -> None:
+        entries = profile.list_notes()
+        body = QWidget()
+        body.setObjectName("notes_scroll_body")
+        v = QVBoxLayout(body)
+        v.setContentsMargins(0, 0, 4, 0)
+        v.setSpacing(6)
+        self._rows.clear()
+        if not entries:
+            empty = QLabel("Пока нет ни одной заметки.")
+            empty.setObjectName("frow_hint")
+            empty.setWordWrap(True)
+            v.addWidget(empty)
+        for info in entries:
+            row = NoteRow(info)
+            row.open_requested.connect(self._open_note)
+            row.delete_requested.connect(self._delete_note)
+            row.set_active(info["path"] == self._active_path)
+            self._rows[info["path"]] = row
+            v.addWidget(row)
+        v.addStretch()
+        old = self._scroll.takeWidget()
+        if old is not None:
+            old.setParent(None)
+            old.deleteLater()
+        self._scroll.setWidget(body)
+
+    def _guard_recording(self) -> bool:
+        """True — можно переключаться/удалять; False — идёт диктовка в текущую
+        заметку, переключение сломало бы адресата результата."""
+        if self._editor.is_recording():
+            QMessageBox.information(
+                self, "Идёт диктовка",
+                "Останови диктовку («⏹ Остановить»), прежде чем переключаться на другую заметку.",
+            )
+            return False
+        return True
+
+    def _new_note(self) -> None:
+        if not self._guard_recording():
+            return
+        path = profile.new_note_path()
+        profile.write_note(path, "")
+        self._active_path = path
+        self._rebuild()
+        self._editor.load(path)  # сразу готова к диктовке/вводу — быстрый флоу
+
+    def _import_note(self) -> None:
+        """T-351: кнопка «Расшифровать файл» — выбор через диалог."""
+        if self._import_file_to_note is None or not self._guard_recording():
+            return
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Аудио или видео для расшифровки", "", audio_import.FILE_DIALOG_FILTER
+        )
+        if chosen:
+            self._import_dropped_file(Path(chosen))
+
+    def _import_dropped_file(self, path: Path) -> None:
+        """Файл выбран или брошен в правую панель — расшифровать в новую заметку."""
+        if self._import_file_to_note is None or not self._guard_recording():
+            return
+        self._editor.save_now_if_dirty()
+        note_path = self._import_file_to_note(path)
+        if note_path is None:
+            return  # отмена или ошибка — их показал сам диалог импорта
+        self._active_path = note_path
+        self._rebuild()
+        self._editor.load(note_path)
+
+    def _open_note(self, path: Path) -> None:
+        if path == self._active_path:
+            return
+        if not self._guard_recording():
+            return
+        if self._active_path in self._rows:
+            self._rows[self._active_path].set_active(False)
+        self._active_path = path
+        if path in self._rows:
+            self._rows[path].set_active(True)
+        self._editor.load(path)
+
+    def _delete_note(self, path: Path) -> None:
+        if not self._guard_recording():
+            return
+        if QMessageBox.question(
+            self, "Удалить заметку", "Удалить заметку без возможности восстановить?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        if path == self._active_path:
+            self._editor.clear()  # снять адресата ДО unlink — иначе автосейв допишет в удалённый файл
+            self._active_path = None
+        profile.delete_note(path)
+        self._rebuild()
+
+    def closeEvent(self, ev) -> None:  # noqa: N802
+        self._editor.save_now_if_dirty()
+        super().closeEvent(ev)
+
+
 class MainWindow(QMainWindow):
     settings_changed = Signal(dict)
     quit_requested = Signal()
     transcription_done = Signal()  # эмитится из transcribe_ui.py thread'а для auto-refresh
+    stop_sound_requested = Signal()  # T-355: звук стопа из worker thread'а (_stop_thread) — QSoundEffect main-thread-only
     _state_change_requested = Signal(str)  # thread-safe мост для set_state из worker thread'ов
     _audio_level_requested = Signal(float)  # thread-safe мост для эквалайзера из sd callback
     # T-172: thread-safe мосты для режима записи созвона (вызовы из worker/watchdog потоков)
@@ -4085,6 +5125,11 @@ class MainWindow(QMainWindow):
     # T-173: индикатор обработки созвона после стопа (блок C)
     _call_processing_requested = Signal(bool, float)  # (active, total_audio_sec)
     _call_progress_requested = Signal(float)          # грубый прогресс транскрипта 0..1
+    _note_text_requested = Signal(str)  # T-352: thread-safe доставка текста диктовки в заметку
+    _note_dictation_ended_requested = Signal()  # T-352: гарантированный сброс кнопки на ЛЮБОМ исходе
+    # T-404: сбой фоновой работы (модель не скачалась / не загрузилась) — из
+    # worker-потока в окно. До этого такие исключения уходили только в _crash.log.
+    _error_requested = Signal(str, str, str)  # заголовок, причина, что делать
 
     def __init__(
         self,
@@ -4098,12 +5143,23 @@ class MainWindow(QMainWindow):
         entry_script: Path,
         toggle_recording_via_ui: Callable[[], None] | None = None,
         toggle_call_via_ui: Callable[[], None] | None = None,
+        toggle_note_recording_via_ui: Callable[[], None] | None = None,
         model_busy_getter: Callable[[], bool] | None = None,
+        file_import_api: "audio_import.FileImportApi | None" = None,
     ) -> None:
         super().__init__()
         self._model_busy_getter = model_busy_getter  # T-259: занят ли движок прямо сейчас
+        self._toggle_note_recording_via_ui = toggle_note_recording_via_ui  # T-352
+        self._note_dictation_target = None  # NoteEditorPanel, ждущий текст диктовки
+        self._file_import_api = file_import_api  # T-351: движок импорта файла
+        # T-404: анти-дубль для окон об ошибках (один сбой умеет прилетать пачкой)
+        self._last_error_sig: str = ""
+        self._last_error_at: float = 0.0
+        self._error_box = None
         self.setWindowTitle("SayType")
         self.resize(760, 620)
+        # T-351: перетаскивание файла в окно — вторая точка входа импорта.
+        self.setAcceptDrops(True)
 
         self._idle_icon = QIcon(str(idle_icon_path))
         self._recording_icon = QIcon(str(recording_icon_path))
@@ -4239,6 +5295,9 @@ class MainWindow(QMainWindow):
         self._call_alert_requested.connect(self._on_call_alert)
         self._call_processing_requested.connect(self._on_call_processing)
         self._call_progress_requested.connect(self._on_call_progress)
+        self._note_text_requested.connect(self._on_note_text_ready)  # T-352
+        self._note_dictation_ended_requested.connect(self._on_note_dictation_ended)  # T-352
+        self._error_requested.connect(self._on_error)  # T-404: сбой из worker'а → окно
         self.refresh_history()
 
     @Slot(float)
@@ -4251,6 +5310,12 @@ class MainWindow(QMainWindow):
     def notify_transcription_done(self) -> None:
         """Thread-safe способ дёрнуть refresh из transcribe_ui.py worker thread'а."""
         self.transcription_done.emit()
+
+    @Slot()
+    def notify_stop_sound(self) -> None:
+        """T-355: thread-safe способ проиграть звук стопа из worker thread'а
+        (_stop_thread) — QSoundEffect можно дёргать только из main thread."""
+        self.stop_sound_requested.emit()
 
     def notify_set_state(self, state: str) -> None:
         """Thread-safe смена state. Qt widgets — main-thread-only; emit() с
@@ -4282,6 +5347,87 @@ class MainWindow(QMainWindow):
     def notify_call_progress(self, fraction: float) -> None:
         """Thread-safe (T-173 C): грубый прогресс транскрипции созвона (0..1)."""
         self._call_progress_requested.emit(float(fraction))
+
+    def notify_note_text(self, text: str) -> None:
+        """T-352: thread-safe доставка результата диктовки-в-заметку из worker
+        thread'а (`_stop_thread` → `stop_recording_and_transcribe`)."""
+        self._note_text_requested.emit(text or "")
+
+    def notify_error(self, title: str, text: str, hint: str = "") -> None:
+        """T-404: thread-safe показ сбоя фоновой работы.
+
+        Единственный путь наверх для worker-потоков (загрузка модели, докачка,
+        откат настроек). Раньше такого пути не было вовсе: исключение из
+        `threading.Thread(target=load_model)` уходило в `_crash.log`, а
+        пользователь смотрел на «Транскрибирую…», которое никогда не кончится.
+        """
+        self._error_requested.emit(str(title or "Сбой"), str(text or ""), str(hint or ""))
+
+    @Slot(str, str, str)
+    def _on_error(self, title: str, text: str, hint: str) -> None:
+        """Main thread: toast (виден при закрытом окне) + окно с полным текстом."""
+        signature = f"{title}|{text}"
+        now = time.time()
+        # Один и тот же сбой умеет повторяться пачкой (preload + откат + диктовка):
+        # три одинаковых окна подряд — это шум, а не информирование.
+        if signature == self._last_error_sig and now - self._last_error_at < 30:
+            return
+        self._last_error_sig, self._last_error_at = signature, now
+        try:
+            self._overlay.show_error(text or title)
+        except Exception:
+            pass
+        body = f"{text}\n\n{hint}" if hint else text
+        try:
+            box = QMessageBox(QMessageBox.Warning, title, body, QMessageBox.Ok, self)
+            box.setAttribute(Qt.WA_DeleteOnClose)
+            box.setWindowModality(Qt.NonModal)  # не блокировать диктовку и трей
+            self._error_box = box               # ссылка, иначе Python снесёт объект
+            box.show()
+            box.raise_()
+        except Exception as exc:
+            print(f"[window] окно ошибки не открылось: {exc}", file=sys.stderr, flush=True)
+
+    def set_note_dictation_target(self, panel) -> None:
+        """T-352: какой NoteEditorPanel получит следующий notify_note_text.
+        Вызывается самой панелью перед стартом записи через кнопку «Диктовать»."""
+        self._note_dictation_target = panel
+
+    def notify_note_dictation_ended(self) -> None:
+        """T-352 (доработка после ревью): thread-safe сигнал о том, что запись
+        в заметку завершилась — даже если её не сопровождал текст (пустой буфер,
+        исключение до `notify_note_text`). Без этого кнопка «Диктовать» залипала
+        на «Распознаю…» на любом исходе кроме happy path."""
+        self._note_dictation_ended_requested.emit()
+
+    @Slot(str)
+    def _on_note_text_ready(self, text: str) -> None:
+        """Main thread (T-284): доставить текст в редактор, если тот ещё открыт —
+        диалог мог закрыться, пока шла транскрипция (C++-объект уже снесён)."""
+        target = self._note_dictation_target
+        self._note_dictation_target = None
+        if target is None:
+            return
+        try:
+            target.append_dictation_text(text)
+        except RuntimeError:
+            pass
+
+    @Slot()
+    def _on_note_dictation_ended(self) -> None:
+        """Main thread: сбросить состояние кнопки на исходах без текста. На
+        happy path `_on_note_text_ready` приходит первым (порядок emit'ов в
+        `_stop_thread` сохраняется в очереди Qt) и уже очищает
+        `_note_dictation_target` — здесь тогда no-op, повторной вставки текста
+        не происходит (этот слот текст не трогает вообще)."""
+        target = self._note_dictation_target
+        self._note_dictation_target = None
+        if target is None:
+            return
+        try:
+            target.note_dictation_ended()
+        except RuntimeError:
+            pass
 
     @Slot(bool)
     def _on_call_state(self, active: bool) -> None:
@@ -4403,6 +5549,8 @@ class MainWindow(QMainWindow):
         self._ico_gear = _mk_icon(_draw_gear, 22, "#52525B")
         self._ico_chart = _mk_icon(_draw_chart, 22, "#52525B")
         self._ico_chip = _mk_icon(_draw_chip, 22, "#52525B")  # T-259: раздел «Модели»
+        self._ico_note = _mk_icon(_draw_note_icon, 22, "#52525B")  # T-352: раздел «Заметки»
+        self._ico_import = _mk_icon(_draw_import, 22, "#52525B")  # T-351: импорт аудиофайла
         self._ico_folder = _mk_icon(_draw_folder, 14, "#52525B")
         self._ico_play = _mk_icon(_draw_play, 14, "#52525B")
         self._ico_pause = _mk_icon(_draw_pause, 14, "#52525B")
@@ -4436,6 +5584,18 @@ class MainWindow(QMainWindow):
         )
         top_row.addWidget(self.call_btn)
 
+        # T-351: импорт аудиофайла — сразу за записью созвона: обе кнопки про
+        # чужое аудио, а не про диктовку с микрофона.
+        self.import_btn = QPushButton()
+        self.import_btn.setObjectName("btn_settings")
+        self.import_btn.setIcon(self._ico_import)
+        self.import_btn.setIconSize(QSize(18, 18))
+        self.import_btn.setToolTip(
+            "Расшифровать аудио- или видеофайл — выбрать или перетащить в окно"
+        )
+        self.import_btn.clicked.connect(self.open_file_import)
+        top_row.addWidget(self.import_btn)
+
         # Иконка папки 18px для большой кнопки (раньше 14px для ghost)
         self._ico_folder_lg = _mk_icon(_draw_folder, 18, "#52525B")
 
@@ -4464,6 +5624,28 @@ class MainWindow(QMainWindow):
         self.models_btn.clicked.connect(self.open_models)
         top_row.addWidget(self.models_btn)
 
+        # T-352: раздел «Заметки» — рядом с «Модели»
+        self.notes_btn = QPushButton()
+        self.notes_btn.setObjectName("btn_settings")
+        self.notes_btn.setIcon(self._ico_note)
+        self.notes_btn.setIconSize(QSize(18, 18))
+        self.notes_btn.setToolTip("Заметки")
+        # Через lambda, а не напрямую: `clicked` отдаёт слоту `checked: bool`, и
+        # он приезжал бы в `select` вместо пути к заметке.
+        self.notes_btn.clicked.connect(lambda: self.open_notes())
+        top_row.addWidget(self.notes_btn)
+
+        # T-354: «Поддержать разработку» — после рабочих инструментов, перед
+        # настройками. Ведёт на страницу вне приложения (см. DONATE_URL).
+        self._ico_heart = _mk_icon(_draw_heart, 18, "#52525B")
+        self.donate_btn = QPushButton()
+        self.donate_btn.setObjectName("btn_settings")
+        self.donate_btn.setIcon(self._ico_heart)
+        self.donate_btn.setIconSize(QSize(18, 18))
+        self.donate_btn.setToolTip("Поддержать разработку")
+        self.donate_btn.clicked.connect(lambda: self.open_donate())
+        top_row.addWidget(self.donate_btn)
+
         self.settings_btn = QPushButton()
         self.settings_btn.setObjectName("btn_settings")
         self.settings_btn.setIcon(self._ico_gear)
@@ -4480,6 +5662,26 @@ class MainWindow(QMainWindow):
         sep_top.setFixedHeight(1)
         sep_top.setStyleSheet("background-color: #E7E7EA;")
         layout.addWidget(sep_top)
+
+        # === T-389: полоса hi-fi ===
+        # Видна только когда режим включён. Счётчик в настройках отвечает на
+        # вопрос «сколько уже накопил» только тому, кто туда зашёл; включённый
+        # режим меняет то, что происходит с каждой записью, и должен быть виден
+        # из главного окна — иначе о нём забывают включённым.
+        self._hifi_bar = QWidget()
+        self._hifi_bar.setStyleSheet("background: #FEF3C7; border-bottom: 1px solid #FDE68A;")
+        _hifi_row = QHBoxLayout(self._hifi_bar)
+        _hifi_row.setContentsMargins(20, 7, 20, 7)
+        _hifi_row.setSpacing(8)
+        self._hifi_label = QLabel()
+        self._hifi_label.setStyleSheet(
+            "color: #92400E; font-size: 12px; background: transparent;"
+            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
+        )
+        _hifi_row.addWidget(self._hifi_label)
+        _hifi_row.addStretch()
+        self._hifi_bar.setVisible(False)
+        layout.addWidget(self._hifi_bar)
 
         # === Скролл-список карточек (full-width, padding внутри 20/12/10/12) ===
         # right=10 чтобы card.right выровнялся с правым краем top buttons.
@@ -4592,11 +5794,16 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.open_settings)
         about_action = QAction("О программе…", self)
         about_action.triggered.connect(self.open_about)
+        # T-354: `triggered` отдаёт слоту `checked: bool` — через lambda, чтобы
+        # он не приехал аргументом (тот же случай, что с кнопкой «Заметки»).
+        donate_action = QAction("Поддержать разработку…", self)
+        donate_action.triggered.connect(lambda: self.open_donate())
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(self._quit)
         menu.addAction(open_action)
         menu.addAction(settings_action)
         menu.addAction(about_action)
+        menu.addAction(donate_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
@@ -4675,9 +5882,28 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Запись", "Колбэк записи не подключён.")
 
+    def _refresh_hifi_bar(self, history_dir: Path) -> None:
+        """T-389: полоса «Hi-fi: накоплено N из 180 мин» — только при включённом режиме."""
+        try:
+            enabled = _as_bool(get_settings().value("hifi_enabled", DEFAULT_HIFI_ENABLED))
+        except Exception:
+            enabled = False
+        self._hifi_bar.setVisible(enabled)
+        if not enabled:
+            return
+        try:
+            minutes = hifi_accumulated_minutes(history_dir)
+        except Exception:
+            minutes = 0.0
+        self._hifi_label.setText(
+            f"Hi-fi диктовка включена · накоплено {minutes:.0f} из {HIFI_TARGET_MINUTES} мин "
+            f"в {profile.HIFI_SUBDIR}\\ — записи в истории остаются обычными"
+        )
+
     def refresh_history(self) -> None:
         history_dir = self._history_dir_getter()
         count = self._rotation_count_getter()
+        self._refresh_hifi_bar(history_dir)
         self._entries = read_history_entries(history_dir, count)
         # T-173 A: транскрипты созвонов из Calls\ (вне ротации надиктовок, T-174)
         self._call_entries = read_call_entries(history_dir / "Calls", CALL_CARDS_MAX)
@@ -4850,6 +6076,9 @@ class MainWindow(QMainWindow):
     def open_about(self) -> None:
         AboutDialog(self).exec()
 
+    def open_donate(self) -> None:
+        open_donate_page()
+
     def open_settings(self) -> None:
         current = load_settings_dict()
         # T-259: во время записи/транскрипции ряд «Модель» в диалоге заблокирован
@@ -4891,6 +6120,152 @@ class MainWindow(QMainWindow):
             before.get("model"), before.get("custom_model")
         ):
             self.settings_changed.emit(after)
+
+    def open_notes(self, select: "Path | None" = None) -> None:
+        """T-352: раздел «Заметки» — отдельно от истории надиктовок (T-350, вопрос №1).
+
+        `select` — заметку открыть сразу (T-351: после импорта файла из главного
+        окна человек оказывается прямо в её тексте, а не ищет её в списке).
+        Не-`Path` здесь игнорируется: слот сигнала `clicked` получил бы `bool`.
+        """
+        if not isinstance(select, Path):
+            select = None
+        dlg = NotesDialog(
+            self,
+            toggle_note_recording_via_ui=self._toggle_note_recording_via_ui,
+            model_busy_getter=self._model_busy_getter,
+            register_dictation_target=self.set_note_dictation_target,
+            import_file_to_note=(
+                self.import_file_to_note if self._file_import_api is not None else None
+            ),
+            select=select,
+        )
+        dlg.exec()
+
+    # === T-351: импорт аудиофайла ===
+
+    def open_file_import(self) -> None:
+        """Кнопка в шапке: выбрать файл, расшифровать и открыть результат заметкой."""
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Аудио или видео для расшифровки", "", audio_import.FILE_DIALOG_FILTER
+        )
+        if chosen:
+            self._import_and_open_note(Path(chosen))
+
+    def _import_and_open_note(self, path: Path) -> None:
+        """Импорт из главного окна: расшифровка сразу открывается в «Заметках»,
+        где её можно поправить — читать её больше негде и не нужно."""
+        note_path = self.start_file_import(path)
+        if note_path is not None:
+            self.open_notes(select=note_path)
+
+    def start_file_import(self, path: Path) -> "Path | None":
+        """Импорт одного файла: прогресс → текст → **новая заметка** + txt рядом.
+
+        Возвращает путь созданной заметки (None — отмена, ошибка или пустой
+        текст). Расшифровка живёт заметкой, потому что её хочется править
+        руками, а не только читать; в списке она помечена «📁 из файла» с именем
+        исходника. В ротируемую историю надиктовок результат не попадает: там
+        буфер на последние N записей, и часовое интервью вытеснило бы живые
+        записи (R5 из T-350). `<файл>.txt` рядом с исходником пишется по-прежнему.
+        """
+        if self._file_import_api is None:
+            QMessageBox.warning(self, "Импорт", "Импорт файлов недоступен в этой сборке.")
+            return None
+        if not audio_import.is_supported(path):
+            # Список расширений — подсказка, а не запрет: набор форматов, который
+            # Qt объявляет, заведомо неполон (opus в нём нет, а файлы читаются).
+            # Поэтому незнакомое расширение предлагаем попробовать, а не отвергаем.
+            answer = QMessageBox.question(
+                self, "Импорт",
+                f"Формат «{path.suffix or 'без расширения'}» не в списке проверенных.\n\n"
+                "Уверенно работают: " + ", ".join(sorted(audio_import.SUPPORTED_SUFFIXES))
+                + "\n\nПопробовать расшифровать этот файл всё равно?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return None
+        dlg = FileImportDialog(self, path, self._file_import_api)
+        accepted = dlg.exec()
+        if not accepted:
+            if dlg.error_text:
+                QMessageBox.warning(self, "Импорт", dlg.error_text)
+            return None  # отмена — молча
+        data = dlg.result_data or {}
+        text = (data.get("text") or "").strip()
+        if not text:
+            # Видео со скринкаста или с выключенным микрофоном — частый случай,
+            # и «речь не распознана» тут увело бы искать проблему не там.
+            quiet = float(data.get("peak", 1.0)) < QUIET_TRACK_PEAK
+            QMessageBox.information(
+                self, "Импорт",
+                "Звуковая дорожка почти беззвучная — похоже, в записи нет голоса "
+                "(выключенный микрофон или видео без звука)."
+                if quiet else
+                "Речь в файле не распознана — текст пустой.",
+            )
+            return None
+        return self._note_from_import(path, text)
+
+    def _note_from_import(self, src: Path, text: str) -> "Path | None":
+        """Расшифровка → новая заметка с меткой источника и именем файла.
+
+        Заголовком (первой строкой) кладём имя файла: список заметок показывает
+        именно её, и «📁 pavel-проба-v2.mp3» читается через месяц, а
+        «Проверка голоса…» — нет. Сам аудиофайл не храним, только имя.
+        """
+        note_path = profile.new_note_path()
+        profile.write_note(note_path, f"{src.stem}\n\n{text}\n")
+        profile.write_note_meta(
+            note_path, source=profile.NOTE_SOURCE_IMPORT, source_name=src.name
+        )
+        return note_path
+
+    def import_file_to_note(self, path: Path) -> "Path | None":
+        """То же самое из раздела «Заметки» — там результат сразу открывается
+        в редакторе, поэтому окно заметок второй раз открывать не нужно."""
+        return self.start_file_import(path)
+
+    def dragEnterEvent(self, ev) -> None:  # noqa: N802
+        """Перетаскивание файла в окно — тот жест, ради которого блок и заводили."""
+        if self._dragged_audio_path(ev) is not None:
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev) -> None:  # noqa: N802
+        if self._dragged_audio_path(ev) is not None:
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dropEvent(self, ev) -> None:  # noqa: N802
+        path = self._dragged_audio_path(ev)
+        if path is None:
+            ev.ignore()
+            return
+        ev.acceptProposedAction()
+        # Диалог модальный — открывать его прямо в обработчике drop'а нельзя:
+        # мышь ещё держит drag-сессию Windows, и окно уходит под неё.
+        QTimer.singleShot(0, lambda p=path: self._import_and_open_note(p))
+
+    @staticmethod
+    def _dragged_audio_path(ev) -> "Path | None":
+        """Один локальный файл в drag'е — иначе None.
+
+        Папки и несколько файлов сразу не берём: пакетный импорт держал бы
+        модель занятой неопределённо долго, это отдельная работа. А вот
+        расширение здесь **не** проверяется — незнакомое лучше принять и
+        спросить в `start_file_import`, чем молча не реагировать на бросок.
+        """
+        data = ev.mimeData()
+        if not data.hasUrls():
+            return None
+        urls = [u for u in data.urls() if u.isLocalFile()]
+        if len(urls) != 1:
+            return None
+        path = Path(urls[0].toLocalFile())
+        return path if path.is_file() else None
 
     def _open_stats(self) -> None:
         """Открыть модальный диалог агрегатов из `<history_dir>/_stats.jsonl`."""

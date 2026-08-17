@@ -82,7 +82,8 @@ LOOP_CHUNK_SIZE = 2048
 # Раньше здесь стоял абсолютный путь, и подпапка созвонов не следовала за
 # настройкой «Папка истории» — теперь следует.
 _history_dir: Path = profile.default_history_dir()
-CALL_AUDIO_KEEP = 2   # T-175: сколько последних WAV созвонов держать в Calls как буфер «вернуться»
+CALL_AUDIO_KEEP = 2   # T-175: минимум последних WAV созвонов держать в Calls как буфер «вернуться»
+CALL_AUDIO_KEEP_MINUTES = 120  # T-386: держим буфер, пока не накопится ~2ч WAV (датасет клона голоса)
 
 
 def set_history_dir(path) -> None:
@@ -786,10 +787,12 @@ def active_model_label() -> str:
 def transcribe_channel(
     model,
     audio_int16: np.ndarray,
-    language: str = WHISPER_LANG,
+    language: "str | None" = WHISPER_LANG,
     progress_cb: Optional[Callable[[float, float], None]] = None,
     initial_prompt: Optional[str] = None,
     postproc: Optional[Callable[[str], str]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    info_out: Optional[dict] = None,
 ) -> list[tuple[float, float, str]]:
     """Один канал → список (start, end, text) с сегментными таймстампами.
 
@@ -802,8 +805,18 @@ def transcribe_channel(
     standalone-CLI живёт без него). ``postproc`` — словарные замены на каждый
     сегмент (UI передаёт post_process с tail_rules=False — хвостовые $-правила
     диктовки в сегментах созвона стреляли бы по живой речи).
+
+    T-351 (импорт файла): ``audio_int16`` принимает и float32 в диапазоне
+    [-1, 1] — тогда деление на 32768 не делается; ``language=None`` включает
+    авто-детект (чужой файл может быть не на русском); ``should_cancel()``
+    опрашивается на каждом сегменте — генератор ленивый, выход из цикла и
+    останавливает работу; ``info_out`` — куда положить ``language`` /
+    ``language_probability`` определённые моделью.
     """
-    audio_f32 = audio_int16.astype(np.float32) / 32768.0
+    if np.issubdtype(audio_int16.dtype, np.floating):
+        audio_f32 = audio_int16.astype(np.float32, copy=False)
+    else:
+        audio_f32 = audio_int16.astype(np.float32) / 32768.0
     segments, info = model.transcribe(
         audio_f32,
         language=language,
@@ -815,9 +828,16 @@ def transcribe_channel(
         # В диктовке выключено ещё hotfix'ом 2026-05-19 — сюда не было портировано.
         condition_on_previous_text=False,
     )
+    if info_out is not None:
+        info_out["language"] = getattr(info, "language", "") or ""
+        info_out["language_probability"] = float(
+            getattr(info, "language_probability", 0.0) or 0.0
+        )
     total = float(getattr(info, "duration", 0.0)) or (len(audio_int16) / 16000.0)
     out: list[tuple[float, float, str]] = []
     for seg in segments:
+        if should_cancel is not None and should_cancel():
+            break
         text = (seg.text or "").strip()
         if text and postproc is not None:
             try:
@@ -1036,12 +1056,32 @@ def recover_recording_to_wav(
     return recording
 
 
-def rotate_call_audio(keep: int = CALL_AUDIO_KEEP, logger: Callable[[str], None] = log) -> int:
+def _wav_duration_sec(path: Path) -> float:
+    """Длительность WAV в секундах, 0.0 если файл битый/нечитаемый."""
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / float(rate) if rate else 0.0
+    except (wave.Error, OSError, EOFError):
+        return 0.0
+
+
+def rotate_call_audio(
+    keep: int = CALL_AUDIO_KEEP,
+    keep_minutes: Optional[float] = None,
+    logger: Callable[[str], None] = log,
+) -> int:
     """Ротация буфера WAV созвонов в папке ``Calls`` (T-175, durability-страховка).
 
     Держим последние ``keep`` WAV-записей созвонов как возможность «вернуться»
     (переслушать / дотранскрибировать, если транскрипт кривой). Старейшие (>keep)
     по mtime удаляются при каждой новой записи. Возвращает число удалённых файлов.
+
+    ``keep_minutes`` (T-386, датасет для клона голоса) расширяет буфер по
+    суммарной длительности: новые WAV держим, пока накопленная длительность
+    (считая от самого свежего) не превысит ``keep_minutes``. ``keep`` при этом
+    работает как пол — не меньше `keep` файлов держим в любом случае, даже если
+    они уже перевалили за порог по времени.
 
     Трогает **только ``*.wav``** в папке ``Calls``: транскрипты ``.md`` (T-174 — не
     ротируются, их разбирает пользователь) и ``.mp3`` (keep_audio-архив) НЕ
@@ -1052,15 +1092,28 @@ def rotate_call_audio(keep: int = CALL_AUDIO_KEEP, logger: Callable[[str], None]
     if keep < 0:
         return 0
     wavs = sorted(calls_dir().glob("*.wav"), key=lambda p: p.stat().st_mtime)
+    if keep_minutes is None:
+        keep_set = set(wavs[len(wavs) - keep :]) if keep else set()
+    else:
+        newest_first = list(reversed(wavs))
+        keep_set = set()
+        total_sec = 0.0
+        for i, p in enumerate(newest_first):
+            if i < keep or total_sec < keep_minutes * 60:
+                keep_set.add(p)
+                total_sec += _wav_duration_sec(p)
+            else:
+                break
     removed = 0
-    while len(wavs) > keep:
-        oldest = wavs.pop(0)
+    for p in wavs:
+        if p in keep_set:
+            continue
         try:
-            oldest.unlink()
+            p.unlink()
             removed += 1
-            logger(f"буфер созвонов: удалён старый WAV {oldest.name} (держим последние {keep})")
+            logger(f"буфер созвонов: удалён старый WAV {p.name} (держим последние {keep} / до {keep_minutes} мин)")
         except OSError as exc:
-            logger(f"[WARN] буфер созвонов: не смог удалить {oldest.name}: {exc}")
+            logger(f"[WARN] буфер созвонов: не смог удалить {p.name}: {exc}")
     return removed
 
 
@@ -1211,7 +1264,7 @@ def finalize_recording(
     # Текущий WAV — новейший по mtime, при keep>=1 не попадёт под удаление.
     # keep из Settings UI (call_audio_keep) или дефолт CALL_AUDIO_KEEP для CLI/standalone.
     keep_n = CALL_AUDIO_KEEP if call_audio_keep is None else int(call_audio_keep)
-    rotate_call_audio(keep=keep_n, logger=logger)
+    rotate_call_audio(keep=keep_n, keep_minutes=CALL_AUDIO_KEEP_MINUTES, logger=logger)
 
     return result
 

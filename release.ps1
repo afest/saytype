@@ -7,6 +7,9 @@
 # фид: приложение умеет брать обновления из папки так же, как из сети. Так цикл
 # обновления проверяется целиком до того, как заведён публичный репозиторий.
 #
+# Перед выпуском — секция `## <версия>` в CHANGELOG.md: скрипт берёт из неё
+# заметки релиза и без неё не стартует.
+#
 # Что нужно один раз:
 #     pip install --user -r requirements.txt pyinstaller velopack
 #     dotnet tool install -g vpk        (SDK — per-user, см. docs/build.md)
@@ -29,7 +32,12 @@ param(
     [string]$RepoUrl = "https://github.com/afest/saytype",
 
     # Пропустить сборку PyInstaller, если dist уже актуален
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+
+    # Имя пакета. Меняется только ради проверки цикла обновления: тестовая
+    # сборка ставится рядом (`%LocalAppData%\<packId>`) и не трогает боевую
+    # установку, а профиль пользователя у них общий — именно его и проверяем.
+    [string]$PackId = "saytype-app"
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +48,31 @@ $vpk = Join-Path $env:USERPROFILE ".dotnet\tools\vpk.exe"
 if (-not (Test-Path $vpk)) {
     throw "vpk не найден ($vpk). Поставьте: dotnet tool install -g vpk"
 }
+
+# --- Заметки релиза (T-328) ---
+# Это текст, который человек прочитает в окне «Доступно обновление», решая,
+# обновляться сейчас или потом. Источник — секция `## <версия>` в CHANGELOG.md.
+#
+# Проверка стоит здесь, до сборки, и роняет выпуск, а не предупреждает. Файл без
+# правила записи умирает: три CHANGELOG.md в соседних проектах доказали это тем,
+# что последняя строка в них написана в день создания. Двадцать минут PyInstaller
+# ради обещания «допишу потом» — цена, которую выпускающий платит один раз.
+$changelogPath = "CHANGELOG.md"
+if (-not (Test-Path $changelogPath)) {
+    throw "Нет $changelogPath — заметки релиза брать неоткуда."
+}
+$changelog = [System.IO.File]::ReadAllText((Resolve-Path $changelogPath).Path)
+$section = [regex]::Match($changelog, "(?ms)^##\s+$([regex]::Escape($Version))\b.*?(?=^##\s|\z)")
+if (-not $section.Success) {
+    throw "В $changelogPath нет секции '## $Version'. Заметки пишутся ДО выпуска: допишите 3-5 строк о том, что изменилось для человека, и запустите снова."
+}
+$notes = (($section.Value -split "`r?`n" | Select-Object -Skip 1) -join "`n").Trim()
+if (-not $notes) {
+    throw "Секция '## $Version' в $changelogPath пустая — в окно обновления писать нечего."
+}
+$notesPath = Join-Path ([System.IO.Path]::GetTempPath()) "saytype-notes-$Version.md"
+[System.IO.File]::WriteAllText($notesPath, $notes, (New-Object System.Text.UTF8Encoding($false)))
+Write-Output "заметки релиза: $(($notes -split "`n").Count) строк из $changelogPath"
 
 # --- Версия в трёх местах должна быть одна ---
 # `__version__` в пакете — то, что приложение покажет в настройках; --packVersion —
@@ -97,13 +130,14 @@ if (-not (Test-Path "dist\saytype\saytype.exe")) {
 # меню и в «Установке и удалении программ» видно нормальное «SayType».
 Write-Output "== vpk pack $Version =="
 & $vpk pack `
-    --packId saytype-app `
+    --packId $PackId `
     --packVersion $Version `
     --packDir "dist\saytype" `
     --mainExe "saytype.exe" `
     --packTitle "SayType" `
     --packAuthors "SayType contributors" `
     --icon "assets\saytype.ico" `
+    --releaseNotes $notesPath `
     --outputDir $OutputDir
 if ($LASTEXITCODE -ne 0) { throw "vpk pack упал (код $LASTEXITCODE)" }
 

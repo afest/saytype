@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 APP_DIR_NAME = "saytype"
@@ -42,6 +43,12 @@ PROMPT_TOKEN_BUDGET = 223
 # Подпапка истории под транскрипты созвонов. Регистр как был: на Windows он не
 # влияет на разрешение пути, а у существующих пользователей папка уже создана.
 CALLS_SUBDIR = "Calls"
+
+# T-389: подпапка истории под hi-fi надиктовки для датасета клона голоса.
+# Отдельная папка, а не флаг у файлов в корне: `rotate_history()` сканирует
+# только корень истории — значит эти записи не удаляются вообще, и весь
+# эксперимент сносится одной папкой, не задевая обычный архив надиктовок.
+HIFI_SUBDIR = "_hi-fi-voice-dataset"
 
 _REPLACEMENTS_VERSION = 1
 
@@ -111,6 +118,114 @@ def runtime_dir() -> Path:
     path = profile_dir() / "runtime"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def sounds_dir() -> Path:
+    """T-355: сгенерированные звуковые сигналы старт/стоп. Как icons_dir — код
+    создаёт их сам, QSoundEffect нужен реальный файл (не байты в памяти)."""
+    path = profile_dir() / "sounds"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# === Заметки (T-352) ===
+# Отдельная сущность с другим сроком жизни, чем история диктовок: не ротируются,
+# живут до ручного удаления. Файлами, не одним JSON (T-350, оценка новых фич):
+# правится чем угодно снаружи, битая заметка не уносит остальные. Класть в
+# history/ нельзя — rotate_history() сканит её корень по `*.wav` и не должен
+# видеть соседей.
+
+def notes_dir() -> Path:
+    path = profile_dir() / "notes"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def new_note_path() -> Path:
+    """Уникальное имя файла заметки. Микросекунды — защита от коллизии, если
+    пользователь создаёт две заметки в один и тот же час:минуту:секунду."""
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+    return notes_dir() / f"{ts}.md"
+
+
+# Откуда взялся текст заметки (T-351): надиктовал, загрузил файл, набрал руками.
+# Живёт в sidecar-файле рядом с заметкой, а не во frontmatter: заметку человек
+# правит в обычном текстовом поле, и служебная шапка в ней мешалась бы.
+NOTE_SOURCE_MANUAL = "manual"
+NOTE_SOURCE_DICTATION = "dictation"
+NOTE_SOURCE_IMPORT = "import"
+
+
+def note_meta_path(path: Path) -> Path:
+    return path.with_suffix(".meta.json")
+
+
+def read_note_meta(path: Path) -> dict:
+    """Метка источника заметки. Нет файла (заметки до T-351) — «набрано руками»."""
+    meta_path = note_meta_path(path)
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"source": NOTE_SOURCE_MANUAL, "source_name": ""}
+    source = str(data.get("source", NOTE_SOURCE_MANUAL))
+    if source not in (NOTE_SOURCE_MANUAL, NOTE_SOURCE_DICTATION, NOTE_SOURCE_IMPORT):
+        source = NOTE_SOURCE_MANUAL
+    return {"source": source, "source_name": str(data.get("source_name", ""))}
+
+
+def write_note_meta(path: Path, *, source: str, source_name: str = "") -> None:
+    """Сам аудиофайл не храним — только имя, чтобы через месяц было понятно,
+    из чего эта расшифровка (T-351, прямое пожелание владельца продукта)."""
+    try:
+        note_meta_path(path).write_text(
+            json.dumps({"source": source, "source_name": source_name}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def list_notes() -> list:
+    """Заметки, новые сверху. Первая строка файла — заголовок (пусто → «Без названия»)."""
+    out = []
+    for path in notes_dir().glob("*.md"):
+        try:
+            text = path.read_text(encoding="utf-8")
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        lines = text.splitlines()
+        title = (lines[0].strip() if lines else "") or "Без названия"
+        preview = " ".join(lines[1:]).strip()[:120]
+        meta = read_note_meta(path)
+        out.append({
+            "path": path, "title": title, "preview": preview, "mtime": mtime,
+            "source": meta["source"], "source_name": meta["source_name"],
+        })
+    out.sort(key=lambda n: n["mtime"], reverse=True)
+    return out
+
+
+def read_note(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def write_note(path: Path, text: str) -> None:
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def delete_note(path: Path) -> None:
+    for target in (path, note_meta_path(path)):
+        try:
+            target.unlink()
+        except OSError:
+            pass
 
 
 def resource_dir() -> Path:

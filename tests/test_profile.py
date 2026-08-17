@@ -116,6 +116,42 @@ def test_token_estimate() -> None:
     check("бюджет объявлен", profile.PROMPT_TOKEN_BUDGET == 223)
 
 
+def test_note_source_meta() -> None:
+    """T-351: откуда взялся текст заметки и как назывался исходный файл."""
+    print("метка источника заметки:")
+    path = profile.new_note_path()
+    profile.write_note(path, "Список дел\n\nЗабрать колёса.")
+    meta = profile.read_note_meta(path)
+    check("без sidecar — вручную", meta["source"] == profile.NOTE_SOURCE_MANUAL, meta["source"])
+    check("имя файла пустое", meta["source_name"] == "")
+
+    imported = profile.new_note_path()
+    profile.write_note(imported, "интервью\n\nтекст расшифровки")
+    profile.write_note_meta(
+        imported, source=profile.NOTE_SOURCE_IMPORT, source_name="интервью.mp3"
+    )
+    meta = profile.read_note_meta(imported)
+    check("источник — импорт", meta["source"] == profile.NOTE_SOURCE_IMPORT, meta["source"])
+    check("имя исходника сохранено", meta["source_name"] == "интервью.mp3", meta["source_name"])
+
+    entries = {n["path"]: n for n in profile.list_notes()}
+    check("список отдаёт источник", entries[imported]["source"] == profile.NOTE_SOURCE_IMPORT)
+    check("список отдаёт имя файла", entries[imported]["source_name"] == "интервью.mp3")
+    check("метка не путается между заметками",
+          entries[path]["source"] == profile.NOTE_SOURCE_MANUAL)
+
+    profile.write_note_meta(imported, source="что-то левое")
+    check("неизвестный источник → вручную",
+          profile.read_note_meta(imported)["source"] == profile.NOTE_SOURCE_MANUAL)
+
+    profile.delete_note(imported)
+    check("удаление уносит и sidecar",
+          not imported.exists() and not profile.note_meta_path(imported).exists())
+    check("sidecar не считается заметкой",
+          all(n["path"].suffix == ".md" for n in profile.list_notes()))
+    profile.delete_note(path)
+
+
 def main() -> int:
     for fn in (
         test_defaults_are_empty,
@@ -125,6 +161,7 @@ def main() -> int:
         test_backreference_replacement,
         test_paths_are_relative_to_profile,
         test_token_estimate,
+        test_note_source_meta,
     ):
         fn()
     print()
