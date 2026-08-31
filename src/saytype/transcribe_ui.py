@@ -2626,13 +2626,16 @@ def download_cuda_layer(parent=None, then_start_model: bool = False) -> None:
 
 # === T-262: фоновая проверка обновлений ===
 class _UpdateBridge(QObject):
-    """Мост из фонового потока проверки обновлений в GUI."""
+    """Мост из фонового потока проверки обновлений и скачивания в GUI."""
 
     found = Signal(object)  # UpdateInfo
+    progress = Signal(int)  # процент 0-100
+    failed = Signal(str)  # текст ошибки
 
 
 _update_bridge: "_UpdateBridge | None" = None
 _update_box = None
+_update_progress_dialog = None
 
 
 def _show_update_offer(info) -> None:
@@ -2669,14 +2672,71 @@ def _show_update_offer(info) -> None:
         if box.clickedButton() is not update_btn:
             log("обновление отложено пользователем")
             return
-        threading.Thread(
-            target=lambda: updater.download_and_apply(info),
-            daemon=True, name="update-apply",
-        ).start()
+        _start_update_download(info)
 
     box.buttonClicked.connect(_on_done)
     _update_box = box
     box.show()
+
+
+def _start_update_download(info) -> None:
+    """Качать с видимым прогрессом — тот же приём, что у CUDA-слоя и модели.
+
+    T-443: раньше здесь просто уходил фоновый поток без единого UI-хука, и
+    человек 10-15 секунд не видел вообще ничего, пока velopack качал и
+    распаковывал пакет — не мог понять, сработало ли нажатие. Ошибка тоже
+    терялась молча: исключение в daemon-потоке без обработчика просто пропадало.
+    """
+    global _update_progress_dialog
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtWidgets import QMessageBox, QProgressDialog
+
+    if _update_progress_dialog is not None:
+        return
+    dlg = QProgressDialog("Скачиваю обновление…", None, 0, 100, window)
+    dlg.setWindowTitle("Обновление SayType")
+    dlg.setWindowModality(_Qt.ApplicationModal)
+    dlg.setMinimumDuration(0)
+    dlg.setAutoClose(False)
+    dlg.setAutoReset(False)
+    dlg.setMinimumWidth(420)
+    dlg.setValue(0)
+    _update_progress_dialog = dlg
+
+    bridge = _update_bridge or _UpdateBridge()
+
+    @Slot(int)
+    def _on_progress(percent: int) -> None:
+        if _update_progress_dialog is not None:
+            _update_progress_dialog.setValue(max(0, min(100, percent)))
+
+    @Slot(str)
+    def _on_failed(error: str) -> None:
+        global _update_progress_dialog
+        if _update_progress_dialog is not None:
+            _update_progress_dialog.close()
+            _update_progress_dialog = None
+        QMessageBox.warning(
+            window, "Обновление не установилось",
+            f"Не получилось скачать или применить обновление:\n{error}\n\n"
+            "Попробуйте ещё раз позже.",
+        )
+
+    bridge.progress.connect(_on_progress)
+    bridge.failed.connect(_on_failed)
+    dlg.show()
+
+    def _run() -> None:
+        # Управление сюда не возвращается при успехе: velopack перезапускает
+        # процесс сам. Ошибка — единственный путь, которым функция возвращается.
+        try:
+            updater.download_and_apply(
+                info, progress_cb=lambda pct: bridge.progress.emit(int(pct)),
+            )
+        except Exception as exc:
+            bridge.failed.emit(str(exc))
+
+    threading.Thread(target=_run, daemon=True, name="update-apply").start()
 
 
 def start_update_check() -> None:
