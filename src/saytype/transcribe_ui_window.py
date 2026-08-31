@@ -5531,7 +5531,6 @@ class MainWindow(QMainWindow):
     _call_processing_requested = Signal(bool, float)  # (active, total_audio_sec)
     _call_progress_requested = Signal(float)          # грубый прогресс транскрипта 0..1
     _note_text_requested = Signal(str)  # T-352: thread-safe доставка текста диктовки в заметку
-    _hifi_band_requested = Signal(bool, str, str)  # T-418: (узкая полоса, микрофон, вывод словами)
     _note_dictation_ended_requested = Signal()  # T-352: гарантированный сброс кнопки на ЛЮБОМ исходе
     # T-404: сбой фоновой работы (модель не скачалась / не загрузилась) — из
     # worker-потока в окно. До этого такие исключения уходили только в _crash.log.
@@ -5711,7 +5710,6 @@ class MainWindow(QMainWindow):
         self._call_processing_requested.connect(self._on_call_processing)
         self._call_progress_requested.connect(self._on_call_progress)
         self._note_text_requested.connect(self._on_note_text_ready)  # T-352
-        self._hifi_band_requested.connect(self._on_hifi_band)  # T-418: полоса последней hi-fi записи
         self._note_dictation_ended_requested.connect(self._on_note_dictation_ended)  # T-352
         self._error_requested.connect(self._on_error)  # T-404: сбой из worker'а → окно
         # T-405: отмена распознавания — кнопка живёт и в плашке над таскбаром
@@ -5747,24 +5745,6 @@ class MainWindow(QMainWindow):
         """Thread-safe обновление эквалайзера. Вызывается из sounddevice
         callback'а (отдельный thread). Throttle на стороне вызывающего."""
         self._audio_level_requested.emit(level)
-
-    def notify_hifi_band(self, narrowband: bool, mic: str, text: str) -> None:
-        """T-418: вывод о полосе последней hi-fi записи — из потока стопа записи."""
-        self._hifi_band_requested.emit(bool(narrowband), str(mic), str(text))
-
-    @Slot(bool, str, str)
-    def _on_hifi_band(self, narrowband: bool, mic: str, text: str) -> None:
-        """Запомнить вывод и перерисовать полосу.
-
-        Держим только последний результат: узкая полоса — это состояние
-        железа, а не событие. Сменил микрофон, наговорил заново — полоса
-        перекрасится сама, отдельного «закрыть» не нужно.
-        """
-        self._hifi_band_warning = (mic, text) if narrowband else None
-        try:
-            self._refresh_hifi_bar(self._history_dir_getter())
-        except Exception:
-            pass
 
     # === T-172: thread-safe API режима записи созвона (emit из worker/watchdog) ===
     def notify_call_state(self, active: bool) -> None:
@@ -6134,29 +6114,6 @@ class MainWindow(QMainWindow):
         sep_top.setStyleSheet("background-color: #E7E7EA;")
         layout.addWidget(sep_top)
 
-        # === T-389: полоса hi-fi ===
-        # Видна только когда режим включён. Счётчик в настройках отвечает на
-        # вопрос «сколько уже накопил» только тому, кто туда зашёл; включённый
-        # режим меняет то, что происходит с каждой записью, и должен быть виден
-        # из главного окна — иначе о нём забывают включённым.
-        # T-418: последняя hi-fi запись пришла с узкополосного источника —
-        # (микрофон, вывод словами). None — всё в порядке.
-        self._hifi_band_warning: "tuple[str, str] | None" = None
-        self._hifi_bar = QWidget()
-        self._hifi_bar.setStyleSheet("background: #FEF3C7; border-bottom: 1px solid #FDE68A;")
-        _hifi_row = QHBoxLayout(self._hifi_bar)
-        _hifi_row.setContentsMargins(20, 7, 20, 7)
-        _hifi_row.setSpacing(8)
-        self._hifi_label = QLabel()
-        self._hifi_label.setStyleSheet(
-            "color: #92400E; font-size: 12px; background: transparent;"
-            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
-        )
-        _hifi_row.addWidget(self._hifi_label)
-        _hifi_row.addStretch()
-        self._hifi_bar.setVisible(False)
-        layout.addWidget(self._hifi_bar)
-
         # === T-405: полоса «модель не скачана» ===
         # Пока весов нет, диктовать нечем — и узнавать об этом в момент, когда
         # уже наговорил, поздно. Полоса висит до тех пор, пока модель не
@@ -6395,48 +6352,6 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Запись", "Колбэк записи не подключён.")
 
-    def _refresh_hifi_bar(self, history_dir: Path) -> None:
-        """T-389: полоса «Hi-fi: накоплено N из 180 мин» — только при включённом режиме."""
-        try:
-            enabled = _as_bool(get_settings().value("hifi_enabled", DEFAULT_HIFI_ENABLED))
-        except Exception:
-            enabled = False
-        self._hifi_bar.setVisible(enabled)
-        if not enabled:
-            return
-        try:
-            minutes = hifi_accumulated_minutes(history_dir)
-        except Exception:
-            minutes = 0.0
-        # T-418: имя микрофона — в самой полосе. Раньше узнать, куда уходит
-        # голос, можно было только через мастер первого запуска, и подмена
-        # системного устройства три дня оставалась незамеченной.
-        mic = current_mic_name()
-        warning = getattr(self, "_hifi_band_warning", None)
-        if warning:
-            self._hifi_bar.setStyleSheet(
-                "background: #FEE2E2; border-bottom: 1px solid #FECACA;"
-            )
-            self._hifi_label.setStyleSheet(
-                "color: #991B1B; font-size: 12px; background: transparent;"
-                " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
-            )
-            self._hifi_label.setText(
-                f"Hi-fi: микрофон «{warning[0]}» — {warning[1]} "
-                f"Накоплено {minutes:.0f} из {HIFI_TARGET_MINUTES} мин."
-            )
-            return
-        self._hifi_bar.setStyleSheet("background: #FEF3C7; border-bottom: 1px solid #FDE68A;")
-        self._hifi_label.setStyleSheet(
-            "color: #92400E; font-size: 12px; background: transparent;"
-            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
-        )
-        self._hifi_label.setText(
-            f"Hi-fi диктовка включена · микрофон: {mic} · накоплено {minutes:.0f} "
-            f"из {HIFI_TARGET_MINUTES} мин в {profile.HIFI_SUBDIR}\\ — "
-            "записи в истории остаются обычными"
-        )
-
     def refresh_nomodel_bar(self) -> None:
         """T-405: показать / убрать полосу «модель не скачана».
 
@@ -6459,7 +6374,6 @@ class MainWindow(QMainWindow):
     def refresh_history(self) -> None:
         history_dir = self._history_dir_getter()
         count = self._rotation_count_getter()
-        self._refresh_hifi_bar(history_dir)
         self.refresh_nomodel_bar()
         self._entries = read_history_entries(history_dir, count)
         # T-173 A: транскрипты созвонов из Calls\ (вне ротации надиктовок, T-174)

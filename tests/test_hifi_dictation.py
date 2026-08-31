@@ -223,15 +223,14 @@ def test_hifi_entries_visible_in_window() -> None:
     )
     window.refresh_history()
     check("надиктовка видна карточкой", len(window._cards) == 1, str(len(window._cards)))
-    # окно не показано, поэтому isVisible() у детей всегда False — спрашиваем isHidden()
-    check("полоса hi-fi не скрыта", window._hifi_bar.isHidden() is False)
-    check("полоса знает про накопленное", "накоплено" in window._hifi_label.text(),
-          window._hifi_label.text()[:70])
 
+    # Полосы hi-fi в главном окне больше нет (убрана перед выпуском 0.3.0):
+    # включённый режим карточек истории не меняет, и выключение — тоже.
     settings.setValue("hifi_enabled", False)
     settings.sync()
     window.refresh_history()
-    check("выключенный режим убирает полосу", window._hifi_bar.isHidden() is True)
+    check("выключенный режим не трогает карточки", len(window._cards) == 1,
+          str(len(window._cards)))
     window.close()
 
 

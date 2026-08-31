@@ -1725,11 +1725,16 @@ def _stop_thread() -> None:
 
 
 def _report_hifi_band(pcm16: "np.ndarray", rate: int) -> None:
-    """Померить полосу сохранённой hi-fi записи и сказать о ней окну и логу.
+    """Померить полосу сохранённой hi-fi записи и записать вывод в лог.
 
     Проверка стоит после сохранения, а не до: испортить надиктовку из-за сбоя в
     измерении нельзя, а сам вывод нужен всё равно постфактум. Тишина и слишком
     короткая запись вывода не дают — тревога на них была бы ложной.
+
+    В окно вывод больше не идёт: полоса hi-fi из главного окна убрана перед
+    выпуском 0.3.0. Замер остаётся в логе — по нему видно, чем писалась
+    конкретная запись, — а спросить про микрофон можно кнопкой «Проверить» в
+    настройках.
     """
     try:
         check = audio_quality.check_samples(pcm16.astype(np.float32) / 32767.0, rate)
@@ -1741,11 +1746,6 @@ def _report_hifi_band(pcm16: "np.ndarray", rate: int) -> None:
     mic = current_mic_name()
     text = audio_quality.describe(check, hifi=True)
     log(f"hi-fi полоса ({mic}): провал ВЧ {check.drop_db:.0f} дБ — {text}")
-    if window is not None:
-        try:
-            window.notify_hifi_band(check.narrowband, mic, text)
-        except Exception as exc:  # окно не должно ронять поток стопа записи
-            log(f"полосу hi-fi не показал: {exc!r}")
 
 
 def toggle_recording(via_ui: bool = False, to_note: bool = False) -> None:
@@ -2780,12 +2780,6 @@ class _Bridge(QObject):
             if pre_roll is not None and pre_roll.is_running():
                 pre_roll.stop()
                 pre_roll.start()
-            # Прошлое предупреждение о полосе относилось к прежнему устройству.
-            if window is not None:
-                try:
-                    window.notify_hifi_band(False, current_mic_name(), "")
-                except Exception as exc:
-                    log(f"полосу hi-fi не сбросил: {exc!r}")
         # T-165: hot-reload processing_mode и auto_threshold_sec не требует side-эффектов —
         # значения снапшотятся в start_recording на каждом hotkey-down. Просто логируем
         # текущие, чтобы по логу было видно, что изменения сохранились.

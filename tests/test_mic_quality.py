@@ -226,56 +226,6 @@ def test_settings_dialog_and_round_trip() -> None:
             sys.modules.pop("sounddevice", None)
 
 
-def test_hifi_bar_names_the_microphone() -> None:
-    print("полоса hi-fi:")
-    from PySide6.QtWidgets import QApplication
-
-    from saytype import transcribe_ui_window as win
-
-    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
-    saved = sys.modules.get("sounddevice")
-    sys.modules["sounddevice"] = _FakeSd()
-    hist = Path(_TMP) / "hist"
-    hist.mkdir(parents=True, exist_ok=True)
-    try:
-        settings = win.get_settings()
-        settings.setValue("hifi_enabled", True)
-        settings.setValue("mic_device", "Микрофон (DJI MIC MINI)")
-        settings.sync()
-        icons = profile.profile_dir() / "icons"
-        window = win.MainWindow(
-            idle_icon_path=icons / "idle.png",
-            recording_icon_path=icons / "recording.png",
-            processing_icon_path=icons / "processing.png",
-            app_icon_path=icons / "app.png",
-            history_dir_getter=lambda: hist,
-            rotation_count_getter=lambda: 5,
-            entry_script=Path(__file__).resolve().parent.parent / "src" / "saytype" / "transcribe_ui.py",
-            model_busy_getter=lambda: False,
-        )
-        window._refresh_hifi_bar(hist)
-        check("микрофон назван в полосе",
-              "Микрофон (DJI MIC MINI)" in window._hifi_label.text(), window._hifi_label.text())
-        check("полоса видна при включённом режиме", window._hifi_bar.isVisibleTo(window))
-
-        window._on_hifi_band(True, "Микрофон (USB Microphone)", "полоса обрезана около 8 кГц")
-        text = window._hifi_label.text()
-        check("предупреждение называет виновника",
-              "USB Microphone" in text and "обрезана" in text, text)
-        check("полоса покраснела", "#FEE2E2" in window._hifi_bar.styleSheet())
-
-        window._on_hifi_band(False, "Микрофон (DJI MIC MINI)", "")
-        check("после смены микрофона предупреждение снимается",
-              "обрезана" not in window._hifi_label.text() and
-              "#FEF3C7" in window._hifi_bar.styleSheet(), window._hifi_label.text())
-        window.close()
-    finally:
-        if saved is not None:
-            sys.modules["sounddevice"] = saved
-        else:
-            sys.modules.pop("sounddevice", None)
-
-
 def main() -> int:
     test_band_check()
     test_says_nothing_when_it_cannot_tell()
@@ -283,7 +233,6 @@ def main() -> int:
     test_device_list_and_resolution()
     test_survives_dead_audio_stack()
     test_settings_dialog_and_round_trip()
-    test_hifi_bar_names_the_microphone()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)} — {', '.join(FAILED)}")
