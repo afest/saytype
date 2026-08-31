@@ -2707,7 +2707,9 @@ def _start_update_download(info) -> None:
     # молчания на реальном апдейте, обратного вызова на этом этапе нет.
     # Неопределённая полоса (setRange(0, 0)) — единственный честный способ
     # сказать «идёт процесс», не обещая процент, которого ещё нет.
-    dlg = QProgressDialog("Готовлюсь к обновлению…", None, 0, 0, window)
+    # cancelButtonText принимает пустую строку как «нет кнопки», а не None —
+    # PySide6 здесь требует str, а не Optional[str] (проверено живым TypeError).
+    dlg = QProgressDialog("Готовлюсь к обновлению…", "", 0, 0, window)
     dlg.setWindowTitle("Обновление SayType")
     dlg.setWindowModality(_Qt.ApplicationModal)
     dlg.setMinimumDuration(0)

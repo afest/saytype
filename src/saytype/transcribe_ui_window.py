@@ -3443,8 +3443,10 @@ class SettingsDialog(QDialog):
         # T-443: до первого вызова progress_cb velopack сам резолвит путь
         # обновления — замерено до 70 сек молчания на реальном апдейте.
         # Неопределённая полоса, пока не пойдут реальные проценты.
+        # cancelButtonText принимает пустую строку как «нет кнопки», а не
+        # None — PySide6 здесь требует str (проверено живым TypeError).
         self._update_progress_dialog = QProgressDialog(
-            "Готовлюсь к обновлению…", None, 0, 0, self,
+            "Готовлюсь к обновлению…", "", 0, 0, self,
         )
         self._update_progress_dialog.setWindowTitle("Обновление SayType")
         self._update_progress_dialog.setWindowModality(Qt.WindowModal)
