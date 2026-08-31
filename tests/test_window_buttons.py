@@ -95,8 +95,50 @@ def test_header_buttons_open_sections() -> None:
     profile.delete_note(note)
 
 
+def test_batch_import_keeps_every_note() -> None:
+    """T-442: заметки, рождённые пачкой при импорте, не затирают друг друга.
+
+    Импорт — тот путь, где интервал между заметками задаёт цикл, а не человек:
+    в UI файлы приходят по одному (`_dragged_audio_path` отбивает drop с
+    несколькими), но сама заметка и её `.meta.json` создаются в `_note_from_import`
+    подряд, и на прежнем коде две расшифровки в одном тике часов делили один
+    путь — второй текст затирал первый вместе с меткой источника.
+    """
+    print("пакетный импорт не теряет заметки:")
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = _build_window(app)
+
+    count = 200
+    made = []
+    for i in range(count):
+        src = Path(_TMP) / f"интервью-{i}.mp3"
+        note = win._note_from_import(src, f"расшифровка {i}")
+        if note is None:
+            break
+        made.append((note, i, src.name))
+
+    check("создались все заметки", len(made) == count, f"создано {len(made)} из {count}")
+    check("пути не повторяются", len({n for n, _, _ in made}) == len(made))
+
+    texts_ok = sum(1 for n, i, name in made
+                   if n.read_text(encoding="utf-8") == f"{Path(name).stem}\n\nрасшифровка {i}\n")
+    check("ни одна расшифровка не затёрта", texts_ok == len(made),
+          f"уцелело {texts_ok} из {len(made)}")
+
+    metas_ok = sum(1 for n, _, name in made
+                   if profile.read_note_meta(n) == {
+                       "source": profile.NOTE_SOURCE_IMPORT, "source_name": name})
+    check("у каждой заметки своя метка источника", metas_ok == len(made),
+          f"совпало {metas_ok} из {len(made)}")
+
+    win.close()
+    for note, _, _ in made:
+        profile.delete_note(note)
+
+
 def main() -> int:
     test_header_buttons_open_sections()
+    test_batch_import_keeps_every_note()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)} — {', '.join(FAILED)}")

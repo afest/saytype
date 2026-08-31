@@ -152,6 +152,47 @@ def test_note_source_meta() -> None:
     profile.delete_note(path)
 
 
+def test_note_names_do_not_collide() -> None:
+    """T-442: имена заметок, созданных в плотном цикле, не совпадают.
+
+    Именно частота тика часов, а не абстрактная уникальность: 600 заметок
+    подряд укладываются в считанные тики Windows, и на прежнем коде из времени
+    с микросекундами их выживало 388 из 600 — остальные затёрлись (замер 31.08).
+    Проверяем не «пути разные», а «на диске лежит столько же текстов, сколько
+    создано, и каждый свой» — затирание видно именно так.
+    """
+    print("имена заметок в плотном цикле:")
+    count = 600
+    body = "заметка {0}\n\nтело {0}".format
+    created = []
+    for i in range(count):
+        path = profile.new_note_path()
+        profile.write_note(path, body(i))
+        profile.write_note_meta(
+            path, source=profile.NOTE_SOURCE_IMPORT, source_name=f"файл-{i}.mp3"
+        )
+        created.append((path, i))
+
+    check("пути не повторяются", len({p for p, _ in created}) == count,
+          f"уникальных {len({p for p, _ in created})} из {count}")
+
+    survived = sum(1 for path, i in created
+                   if path.read_text(encoding="utf-8") == body(i))
+    check("ни один текст не затёрт", survived == count, f"уцелело {survived} из {count}")
+
+    metas = sum(1 for path, i in created
+                if profile.read_note_meta(path)["source_name"] == f"файл-{i}.mp3")
+    check("у каждой заметки свой .meta.json", metas == count, f"совпало {metas} из {count}")
+
+    listed = profile.list_notes()
+    check("список видит все заметки", len(listed) >= count, f"в списке {len(listed)}")
+
+    for path, _ in created:
+        profile.delete_note(path)
+    left = list(profile.notes_dir().glob("*"))
+    check("временные заметки убраны", left == [], f"осталось {len(left)}")
+
+
 def main() -> int:
     for fn in (
         test_defaults_are_empty,
@@ -162,6 +203,7 @@ def main() -> int:
         test_paths_are_relative_to_profile,
         test_token_estimate,
         test_note_source_meta,
+        test_note_names_do_not_collide,
     ):
         fn()
     print()
