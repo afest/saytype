@@ -3437,6 +3437,10 @@ class SettingsDialog(QDialog):
         self._update_progress_dialog.setMinimumDuration(0)
         self._update_progress_dialog.setValue(0)
         self._update_progress_dialog.show()
+        # На быстром апдейте скачивание могло завершиться и убить процесс
+        # раньше, чем Qt успевал отрисовать первый кадр — .show() только
+        # планирует показ. Форсируем прорисовку синхронно.
+        QApplication.processEvents()
 
         def _run() -> None:
             # Управление из download_and_apply не возвращается при успехе:

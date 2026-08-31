@@ -2725,6 +2725,11 @@ def _start_update_download(info) -> None:
     bridge.progress.connect(_on_progress)
     bridge.failed.connect(_on_failed)
     dlg.show()
+    # На быстром апдейте (маленький delta, хороший канал) скачивание могло
+    # завершиться и убить процесс раньше, чем Qt успевал отрисовать первый
+    # кадр диалога — .show() только планирует показ, реальная прорисовка
+    # ждёт следующего прохода event loop. Форсируем его синхронно.
+    QApplication.processEvents()
 
     def _run() -> None:
         # Управление сюда не возвращается при успехе: velopack перезапускает
