@@ -453,15 +453,35 @@ class ModelDownloadError(RuntimeError):
     английского текста про snapshot folder — и уходил в `_crash.log`, а
     пользователь смотрел на «идёт работа» вечно. Теперь у ошибки есть `hint`
     («что делать»), и оба поля показывает окно.
+
+    `retryable` (T-405) — «сбой похож на маршрутный»: имеет смысл повторить по
+    другому маршруту. Нет места на диске или отказ в правах — не имеет.
     """
 
-    def __init__(self, message: str, *, hint: str = "", cause: BaseException | None = None) -> None:
+    def __init__(self, message: str, *, hint: str = "", cause: BaseException | None = None,
+                 retryable: bool = False) -> None:
         super().__init__(message)
         self.hint = hint
         self.cause = cause
+        self.retryable = retryable
 
     def full_text(self) -> str:
         return f"{self}\n\n{self.hint}" if self.hint else str(self)
+
+
+class DownloadCancelled(RuntimeError):
+    """Скачивание оборвал сам пользователь (T-405) — это не сбой.
+
+    Отдельный тип, потому что обрабатывается противоположно `ModelDownloadError`:
+    окно с текстом «не удалось скачать» на собственное нажатие «Отмена» — ровно
+    то, чего пользователь не ждёт. Наверх уходит как «отменено», без ретраев и
+    без отката маршрута.
+    """
+
+    def __init__(self, done_bytes: int = 0, total_bytes: int = 0) -> None:
+        super().__init__("скачивание отменено пользователем")
+        self.done_bytes = int(done_bytes)
+        self.total_bytes = int(total_bytes)
 
 
 def _exc_chain(exc: BaseException) -> list[BaseException]:
@@ -498,6 +518,7 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 _download_proxy: str = ""
+_proxy_from_settings_read = False
 
 
 def set_download_proxy(value: str, logger: Callable[[str], None] = log) -> None:
@@ -508,7 +529,11 @@ def set_download_proxy(value: str, logger: Callable[[str], None] = log) -> None:
     IP, и запрос всё равно уходит через ту же ноду, которая теряет
     huggingface.co. Помогает только явный адрес маршрута, который работает.
     """
-    global _download_proxy
+    global _download_proxy, _proxy_from_settings_read
+    # Вызвали снаружи — источник правды теперь он, файл больше не перечитываем
+    # (T-406). Флаг ставится ДО раннего выхода: повтор того же значения — тоже
+    # слово вызывающего, и пустая строка от него законна.
+    _proxy_from_settings_read = True
     value = (value or "").strip()
     if value == _download_proxy:
         return
@@ -519,6 +544,37 @@ def set_download_proxy(value: str, logger: Callable[[str], None] = log) -> None:
 
 def download_proxy() -> str:
     return _download_proxy
+
+
+def _load_proxy_from_settings(logger: Callable[[str], None] = log) -> None:
+    """Подхватить «Прокси загрузки» из settings.ini, если его никто не задал.
+
+    Настройку пишет окно настроек, а `set_download_proxy` зовёт только оно
+    (T-404) — поэтому `words_timings.py`, `~/.claude/scripts/transcribe.py` и
+    любой следующий скрипт качали веса медленным маршрутом, хотя рабочий адрес
+    лежал в профиле. Замер T-406 на одном и том же файле: 0,50 МБ/с системным
+    маршрутом против 2,20 МБ/с через настроенный прокси.
+
+    Читаем `configparser`, а не QSettings: engine обязан работать без Qt —
+    батч-скрипты его не поднимают.
+    """
+    global _proxy_from_settings_read
+    if _proxy_from_settings_read:
+        return
+    _proxy_from_settings_read = True
+    try:
+        import configparser
+
+        from . import profile
+
+        cfg = configparser.ConfigParser()
+        cfg.read(profile.settings_file(), encoding="utf-8")
+        value = (cfg.get("General", "download_proxy", fallback="") or "").strip()
+    except Exception as exc:
+        logger(f"прокси загрузки из настроек не прочитан: {exc.__class__.__name__}")
+        return
+    if value:
+        set_download_proxy(value, logger)
 
 
 class _DownloadRoute:
@@ -533,12 +589,13 @@ class _DownloadRoute:
 
     _KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
 
-    def __init__(self, logger: Callable[[str], None] = log) -> None:
+    def __init__(self, logger: Callable[[str], None] = log, enabled: bool = True) -> None:
         self._logger = logger
+        self._enabled = enabled
         self._saved: dict[str, Optional[str]] = {}
 
     def __enter__(self) -> "_DownloadRoute":
-        if not _download_proxy:
+        if not _download_proxy or not self._enabled:
             return self
         self._saved = {k: os.environ.get(k) for k in self._KEYS}
         for key in self._KEYS:
@@ -621,6 +678,7 @@ def _download_error(exc: BaseException, repo: str) -> ModelDownloadError:
                 f"настройках (адрес маршрута, который работает).\nПодробно: {detail[:300]}"
             ),
             cause=exc,
+            retryable=True,
         )
     if type(exc).__name__ in ("OSError", "PermissionError") or "No space" in str(exc):
         return ModelDownloadError(
@@ -633,6 +691,19 @@ def _download_error(exc: BaseException, repo: str) -> ModelDownloadError:
         hint="Попробуй ещё раз; если повторяется — смотри runtime\\saytype.log в профиле.",
         cause=exc,
     )
+
+
+def _with_routes(err: ModelDownloadError, tried: list[str]) -> ModelDownloadError:
+    """Дописать в подсказку, какими маршрутами ходили (T-405).
+
+    Без этого «нет связи с huggingface.co» не отличает «мёртвый прокси» от
+    «интернета нет вообще»: человек читает один и тот же текст в двух разных
+    ситуациях и не знает, куда смотреть.
+    """
+    if len(tried) < 2:
+        return err
+    err.hint = (err.hint + "\n\n" if err.hint else "") + "Пробовал: " + ", ".join(tried) + "."
+    return err
 
 
 def _repo_cache_dir(repo_id: str, root: Path) -> Path:
@@ -696,11 +767,134 @@ def _repo_total_bytes(repo_id: str) -> int:
 
 
 _dl_lock = threading.Lock()
-_dl_state: dict = {"cb": None, "done": 0, "total": 0}
+_dl_state: dict = {"cb": None, "done": 0, "total": 0, "cancel": None}
+
+# Через столько секунд без единого нового байта закачку считаем застрявшей и
+# говорим это словами. 15 сек — с запасом больше паузы между кусками даже на
+# медленном маршруте (см. HUB_CHUNK_BYTES) и заметно меньше терпения человека.
+STALL_AFTER_SEC = 15.0
+
+# Размер куска, которым hub читает ответ. Дефолт `huggingface_hub` 1.12 — 10 МБ,
+# и это ломало обе половины T-405 разом: прогресс приходит РАЗ В КУСОК, поэтому
+# на живом замере шкала стояла по 18 секунд на здоровой закачке (не отличить от
+# застоя), а отмена — проверяется там же и ждала бы столько же. 512 КБ дают
+# обновление раз в ~4 секунды даже на 115 КБ/с — том самом сломанном маршруте
+# из T-404. На скорость скачивания размер куска не влияет: это буфер чтения
+# уже открытого потока, а не размер запроса.
+HUB_CHUNK_BYTES = 512 * 1024
+
+
+class DownloadProgress:
+    """Счётчик скорости и остатка для шкалы скачивания (T-405).
+
+    Живёт в engine, а не в UI, потому что шкал две — карточка модели в разделе
+    «Модели» и окно загрузки на старте — и текст в них обязан быть один.
+    Считает по окну последних замеров, а не от старта: закачка на плохом
+    маршруте разгоняется и стопорится, и средняя за всё время показывала бы
+    бодрые мегабайты в секунду на давно вставшей загрузке.
+    """
+
+    WINDOW_SEC = 12.0
+
+    def __init__(self) -> None:
+        self._samples: list[tuple[float, int]] = []
+        self._last_done = 0
+        self._last_change = time.monotonic()
+        self.done = 0
+        self.total = 0
+
+    def feed(self, done: int, total: int) -> None:
+        now = time.monotonic()
+        self.done, self.total = int(done), int(total)
+        if self.done != self._last_done:
+            self._last_done = self.done
+            self._last_change = now
+        self._samples.append((now, self.done))
+        cutoff = now - self.WINDOW_SEC
+        if len(self._samples) > 2:
+            self._samples = [s for s in self._samples if s[0] >= cutoff] or self._samples[-2:]
+
+    def speed_bps(self) -> float:
+        """Байт в секунду по окну замеров. 0 — данных ещё нет.
+
+        Конец окна — ТЕКУЩИЙ момент, а не последний замер: пока байты не идут,
+        новых замеров нет вообще, и скорость по паре старых точек оставалась бы
+        бодрой. С «сейчас» она честно падает к нулю, а ETA растёт — ещё до того,
+        как сработает порог застоя.
+        """
+        if len(self._samples) < 2:
+            return 0.0
+        (t0, d0), (t1, d1) = self._samples[0], self._samples[-1]
+        dt = max(t1, time.monotonic()) - t0
+        return (d1 - d0) / dt if dt > 0.5 and d1 > d0 else 0.0
+
+    def stall_sec(self) -> float:
+        """Сколько секунд не прибавлялись байты."""
+        return max(0.0, time.monotonic() - self._last_change)
+
+    def eta_sec(self) -> float:
+        """Оценка остатка в секундах. 0 — оценить нечем."""
+        speed = self.speed_bps()
+        if speed <= 0 or self.total <= 0 or self.done >= self.total:
+            return 0.0
+        return (self.total - self.done) / speed
+
+    def text(self) -> str:
+        """Одна строка для шкалы: объём · скорость · остаток либо застой."""
+        if self.total > 0:
+            head = f"{self.done / 1e6:.0f} / {self.total / 1e6:.0f} МБ"
+        else:
+            head = f"{self.done / 1e6:.0f} МБ"
+        stall = self.stall_sec()
+        if stall >= STALL_AFTER_SEC:
+            return f"{head} · нет данных {stall:.0f} сек"
+        speed = self.speed_bps()
+        if speed <= 0:
+            return head
+        parts = [head, f"{speed / 1e6:.1f} МБ/с"]
+        eta = self.eta_sec()
+        if eta > 0:
+            parts.append(f"осталось ~{fmt_duration(eta)}")
+        return " · ".join(parts)
+
+    def stalled(self) -> bool:
+        return self.stall_sec() >= STALL_AFTER_SEC
+
+
+def _sleep_cancellable(seconds: float, should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Пауза, которую можно прервать нажатием «Отмена»."""
+    if should_cancel is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            if should_cancel():
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+
+def fmt_duration(seconds: float) -> str:
+    """Человеческая длительность: «40 сек», «3 мин», «1 ч 20 мин»."""
+    sec = max(0, int(seconds))
+    if sec < 60:
+        return f"{sec} сек"
+    if sec < 3600:
+        return f"{round(sec / 60)} мин"
+    hours, rest = divmod(sec, 3600)
+    return f"{hours} ч {round(rest / 60)} мин" if rest >= 60 else f"{hours} ч"
 
 
 def _make_progress_tqdm():
-    """tqdm-подкласс, который скармливает байты нашему progress_cb."""
+    """tqdm-подкласс, который скармливает байты нашему progress_cb.
+
+    Он же — точка отмены (T-405): `huggingface_hub` не даёт API прерывания, и
+    единственное место, куда мы попадаем изнутри его сетевого цикла, — этот
+    колбэк. Исключение отсюда прекращает и текущую загрузку файла, и
+    (через executor) весь снапшот.
+    """
     try:
         from tqdm.auto import tqdm as _tqdm
     except Exception:
@@ -712,10 +906,18 @@ def _make_progress_tqdm():
             if getattr(self, "unit", "") == "B" and n:
                 with _dl_lock:
                     cb = _dl_state["cb"]
+                    cancel = _dl_state["cancel"]
                     if cb is None:
                         return res
                     _dl_state["done"] += int(n)
                     done, total = _dl_state["done"], _dl_state["total"]
+                if cancel is not None:
+                    try:
+                        stop = bool(cancel())
+                    except Exception:
+                        stop = False
+                    if stop:
+                        raise DownloadCancelled(done, total)
                 try:
                     cb(done, total)
                 except Exception:
@@ -729,6 +931,7 @@ def ensure_downloaded(
     spec: str,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     logger: Callable[[str], None] = log,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Скачать модель, если её нет ни в нашей папке, ни в общем HF-кэше.
 
@@ -740,6 +943,12 @@ def ensure_downloaded(
     `DOWNLOAD_ATTEMPTS` попыток с паузой, и только потом отказ. Любой отказ
     уходит наверх как `ModelDownloadError` с причиной и следующим шагом:
     вызывающий обязан показать это в окне, а не оставить «идёт работа».
+
+    T-405: `should_cancel()` опрашивается на каждом куске байтов — отмена
+    прилетает как `DownloadCancelled` и наверх идёт как есть, без ретраев.
+    Заданный «Прокси загрузки» больше не единственный маршрут: когда попытки
+    через него исчерпаны, делается ещё одна по системному маршруту (случай
+    «VPN умер, а прокси остался в настройках»).
     """
     if is_local_path(spec):
         if not Path(spec).is_dir():
@@ -756,38 +965,86 @@ def ensure_downloaded(
     # Огрызок от прошлой оборванной попытки (папка есть, весов нет) — снести до
     # старта, иначе он остаётся висеть после успеха и путает следующий запуск.
     clean_partial_cache(repo, root, logger)
-    with _DownloadRoute(logger):
-        _download_snapshot(repo, spec, root, progress_cb, logger)
+
+    _load_proxy_from_settings(logger)  # T-406: скрипты сами настройку не читают
+
+    routes: list[tuple[str, bool]] = []
+    if _download_proxy:
+        routes.append((f"прокси загрузки {_download_proxy}", True))
+    routes.append(("системный маршрут", False))
+
+    tried: list[str] = []
+    for index, (label, via_proxy) in enumerate(routes):
+        tried.append(label)
+        last_route = index >= len(routes) - 1
+        try:
+            with _DownloadRoute(logger, enabled=via_proxy):
+                _download_snapshot(repo, spec, root, progress_cb, logger,
+                                   should_cancel=should_cancel, route=label)
+            return
+        except ModelDownloadError as exc:
+            if last_route or not exc.retryable:
+                raise _with_routes(exc, tried)
+            logger(f"скачивание {repo}: {label} не сработал ({exc}) — пробую системный маршрут")
+            _reset_hub_session(logger)
 
 
 def _download_snapshot(repo: str, spec: str, root: Path,
                        progress_cb: Optional[Callable[[int, int], None]],
-                       logger: Callable[[str], None]) -> None:
+                       logger: Callable[[str], None],
+                       should_cancel: Optional[Callable[[], bool]] = None,
+                       route: str = "") -> None:
     """Тело скачивания: метаданные, попытки с докачкой, проверка состава."""
     total = _repo_total_bytes(repo)
     logger(f"скачиваю {repo} → {root} ({total / 1e6:.0f} МБ)" if total else f"скачиваю {repo} → {root}")
-    if _download_proxy:
-        logger(f"маршрут скачивания: {_download_proxy}")
+    logger(f"маршрут скачивания: {route or 'системный'}")
 
+    from huggingface_hub import constants as hub_constants
     from huggingface_hub import snapshot_download
 
     tqdm_cls = _make_progress_tqdm()
     kwargs = {"allow_patterns": ALLOW_PATTERNS, "cache_dir": str(root)}
-    if tqdm_cls is not None and progress_cb is not None:
+    if tqdm_cls is not None and (progress_cb is not None or should_cancel is not None):
         kwargs["tqdm_class"] = tqdm_cls
+    prev_chunk = getattr(hub_constants, "DOWNLOAD_CHUNK_SIZE", None)
+    if prev_chunk is not None:
+        hub_constants.DOWNLOAD_CHUNK_SIZE = HUB_CHUNK_BYTES
+    # T-405: качаем обычным HTTP, а не через Xet. Xet (`hf_xet`) — нативный
+    # загрузчик: прогресс он отдаёт из Rust-колбэка, и наше исключение оттуда
+    # НЕ ОСТАНАВЛИВАЕТ загрузку — на замере поток жил ещё минуты после «Отмены»,
+    # то есть кнопка врала бы. На классическом пути отмена срабатывает за 0,0–0,3
+    # сек, шкала обновляется раз в секунду, докачка с места работает. Скорость на
+    # этой машине при этом не теряется: замер 17.08 дал ~1,4 МБ/с на обычном пути
+    # против нуля у Xet (тот вообще не пробился через VPN-маршрут).
+    prev_xet = getattr(hub_constants, "HF_HUB_DISABLE_XET", None)
+    if prev_xet is not None:
+        hub_constants.HF_HUB_DISABLE_XET = True
     try:
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            if should_cancel is not None and should_cancel():
+                raise DownloadCancelled(_downloaded_bytes(repo, root), total)
             # Прогресс начинаем не с нуля, а с того, что уже лежит на диске:
             # после обрыва докачка продолжает файл, и счётчик tqdm считает
             # только новые байты — иначе шкала после повтора врала бы вдвое.
             with _dl_lock:
                 _dl_state.update({
                     "cb": progress_cb, "done": _downloaded_bytes(repo, root), "total": total,
+                    "cancel": should_cancel,
                 })
             try:
                 snapshot_download(repo, **kwargs)
                 break
+            except DownloadCancelled:
+                raise  # нажатие «Отмена» — не сбой, ретраить нечего
             except Exception as exc:
+                if any(isinstance(e, DownloadCancelled) for e in _exc_chain(exc)) or (
+                    should_cancel is not None and should_cancel()
+                ):
+                    # hub заворачивает исключение воркера в своё — отмена внутри
+                    # обёртки всё равно остаётся отменой. Второе условие ловит
+                    # случай, когда загрузка упала уже ПОСЛЕ нажатия «Отмена»:
+                    # показывать там сетевую ошибку было бы враньём.
+                    raise DownloadCancelled(_downloaded_bytes(repo, root), total) from exc
                 last = attempt >= DOWNLOAD_ATTEMPTS
                 if last or not _is_retryable(exc):
                     raise _download_error(exc, repo) from exc
@@ -796,10 +1053,18 @@ def _download_snapshot(repo: str, spec: str, root: Path,
                 # Клиент мог остаться закрытым после обрыва — тогда повтор без
                 # сброса упал бы мгновенно и «повторов» было бы три пустых.
                 _reset_hub_session(logger)
-                time.sleep(RETRY_PAUSE_SEC * attempt)
+                # Пауза перед повтором — с оглядкой на кнопку «Отмена»: спать
+                # десяток секунд, пока человек уже нажал, значит не отменить.
+                _sleep_cancellable(RETRY_PAUSE_SEC * attempt, should_cancel)
+                if should_cancel is not None and should_cancel():
+                    raise DownloadCancelled(_downloaded_bytes(repo, root), total)
     finally:
         with _dl_lock:
-            _dl_state.update({"cb": None, "done": 0, "total": 0})
+            _dl_state.update({"cb": None, "done": 0, "total": 0, "cancel": None})
+        if prev_chunk is not None:
+            hub_constants.DOWNLOAD_CHUNK_SIZE = prev_chunk
+        if prev_xet is not None:
+            hub_constants.HF_HUB_DISABLE_XET = prev_xet
     if not is_cached(spec):
         # snapshot_download отработал, но состав неполный: так выглядит и
         # выкачка одних json'ов, и потерянный `preprocessor_config.json` при
@@ -816,6 +1081,10 @@ def _download_snapshot(repo: str, spec: str, root: Path,
             + (f" — не хватает: {', '.join(missing)}." if missing else "."),
             hint="Нажми «Скачать» ещё раз — недостающие файлы докачаются, "
                  f"уже скачанное не пропадёт. Папка: {_repo_cache_dir(repo, root)}",
+            # Ровно так выглядел T-404 на живой машине: веса доехали, а мелкий
+            # json — нет, потому что маршрут терял huggingface.co. Значит смысл
+            # повторить это по другому маршруту есть.
+            retryable=True,
         )
     logger(f"скачано: {repo}")
 
@@ -1083,6 +1352,7 @@ def load_model(
     logger: Callable[[str], None] = log,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     force_reload: bool = False,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ):
     """Загрузить (или вернуть из кэша) WhisperModel по спеке.
 
@@ -1109,7 +1379,8 @@ def load_model(
         if _model is not None:
             unload_model(logger=logger)
 
-        ensure_downloaded(spec, progress_cb=progress_cb, logger=logger)
+        ensure_downloaded(spec, progress_cb=progress_cb, logger=logger,
+                          should_cancel=should_cancel)
         target = str(Path(spec)) if is_local_path(spec) else spec
         cache_dir = _cache_dir_for(spec)
         root_kw = {"download_root": str(cache_dir)} if cache_dir else {}

@@ -177,6 +177,28 @@ actually loads on a given driver and CTranslate2 build is hard to predict, and
 trying is cheap and honest. Pascal-era cards end up two or three steps down the
 chain and still work.
 
+## 13. Input quality is measured from the signal, not asked of the driver
+
+A narrowband source — a webcam microphone, or a Bluetooth headset in Hands-Free
+mode — reports itself to Windows as an ordinary 48 kHz device.
+`sd.InputStream(samplerate=48000)` opens on it without an error and the audio
+arrives upsampled from 16 kHz, with nothing above 8 kHz. Settings keep showing
+"hi-fi 48 000 Hz" while every recording is quietly ruined; that cost three days
+of voice-clone material before it was noticed.
+
+So `audio_quality.py` measures the signal instead: how far the 9.5–14 kHz band
+sits below the 0.3–3 kHz speech band, over the loudest 20 % of frames. A live
+microphone has room noise and sibilants up there; an upsampled 16 kHz stream has
+digital silence. On a labelled set of 420 real recordings the two populations are
+separated by more than 20 dB, and the threshold sits between them.
+
+The result is surfaced where the decision is made: the settings row names the
+device Windows currently considers default, a "Check" button records three
+seconds and says what it heard, and the hi-fi banner names the microphone and
+turns red when the last recording came from a narrowband source. Silence, clips
+shorter than a second and genuinely 16 kHz sources produce no verdict at all — a
+false alarm in the background devalues the real one.
+
 ## Deliberately not done
 
 - **Diarization by model.** Two channels already separate speakers for calls, and

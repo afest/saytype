@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import audio_import  # T-351: декодер аудиофайла (QAudioDecoder) + контракт импорта
+from . import audio_quality  # T-418: список микрофонов и проверка полосы сигнала
 from . import cuda_layer  # T-261: докачиваемый CUDA-рантайм (строка «Ускорение GPU»)
 from . import engine  # T-259: пресеты моделей, валидация «своей модели», учёт места
 from . import profile  # где лежат настройки, словарь и замены
@@ -59,6 +60,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -456,6 +458,24 @@ def _valid_hifi_rate(value) -> int:
     except (TypeError, ValueError):
         return DEFAULT_HIFI_SAMPLE_RATE
     return rate if rate in HIFI_SAMPLE_RATES else DEFAULT_HIFI_SAMPLE_RATE
+
+
+def current_mic_name() -> str:
+    """Имя микрофона, с которого сейчас идёт запись (T-418).
+
+    Читаем настройку напрямую, а не через `transcribe_ui`: окно живёт и в
+    тестах, где точка входа не поднята. Пустая настройка — спрашиваем Windows.
+    """
+    try:
+        name = (get_settings().value("mic_device", DEFAULT_MIC_DEVICE, type=str) or "").strip()
+    except Exception:
+        name = ""
+    if name:
+        return name
+    try:
+        return audio_quality.default_input_name() or "системный"
+    except Exception:
+        return "системный"
 
 
 def hifi_dir(history_dir: Path) -> Path:
@@ -1423,6 +1443,26 @@ class StatusOverlay(QWidget):
         _check_painter.end()
         self._check.setPixmap(_check_pix)
 
+        # T-405: «Отменить» прямо в плашке. Главное место выхода: окно
+        # обычно закрыто, приложение живёт в трее, и застрявшую транскрипцию
+        # пользователь видит именно здесь. Плашка `WindowDoesNotAcceptFocus` — это про
+        # клавиатуру, мышь по ней работает.
+        self._cancel_btn = QPushButton("Отменить")
+        self._cancel_btn.setObjectName("toast_cancel")
+        self._cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton#toast_cancel {"
+            " background: transparent; border: 1px solid #5B5B62; border-radius: 12px;"
+            " color: #FFFFFF; font-size: 12px; padding: 0 12px;"
+            " min-height: 24px; max-height: 24px;"
+            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif; }"
+            "QPushButton#toast_cancel:hover { background: #2F2F35; border-color: #7A7A83; }"
+            "QPushButton#toast_cancel:disabled { color: #8A8A92; border-color: #3A3A40; }"
+        )
+        self._cancel_btn.hide()
+        self._on_cancel = None
+        self._cancel_connected = False
+
         row.addWidget(self._dot)
         row.addWidget(self._spinner)
         row.addWidget(self._check)
@@ -1430,6 +1470,7 @@ class StatusOverlay(QWidget):
         row.addWidget(self._time)
         row.addWidget(self._sep)
         row.addWidget(self._bars_widget)
+        row.addWidget(self._cancel_btn)
 
         # По CSS `.toast { background: #1F1F22; border: 1px solid #2F2F35; border-radius: 999px; }`
         # Высота 40 → radius 20 = pill. Цвета 100% opacity.
@@ -1447,6 +1488,31 @@ class StatusOverlay(QWidget):
         self._dot_anim_timer.setInterval(700)
         self._dot_visible = True
         self._dot_anim_timer.timeout.connect(self._toggle_dot)
+
+    def set_cancel_handler(self, handler) -> None:
+        """Что делать по «Отменить» в плашке (T-405). None — кнопки не будет.
+
+        Само соединение делаем один раз: `disconnect()` на неподключённый сигнал
+        PySide встречает предупреждением в консоль, а обработчик тут меняется
+        разве что на None.
+        """
+        if not self._cancel_connected:
+            self._cancel_btn.clicked.connect(self._fire_cancel)
+            self._cancel_connected = True
+        self._on_cancel = handler
+
+    def _fire_cancel(self) -> None:
+        if self._on_cancel is not None:
+            self._on_cancel()
+
+    def show_cancelling(self) -> None:
+        """Отмена нажата — ждём выхода worker'а. Кнопку гасим, чтобы не жали дважды."""
+        if not self._cancel_btn.isVisible():
+            return
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Останавливаю…")
+        self._label.setText("Останавливаю…")
+        self._position_bottom()
 
     def _toggle_dot(self) -> None:
         self._dot_visible = not self._dot_visible
@@ -1474,6 +1540,10 @@ class StatusOverlay(QWidget):
         self._spinner.setPixmap(pix)
 
     def show_state(self, state: str) -> None:
+        self._cancel_btn.setVisible(state == "processing" and self._on_cancel is not None)
+        if state == "processing":
+            self._cancel_btn.setEnabled(True)
+            self._cancel_btn.setText("Отменить")
         if state == "recording":
             self._dot.show()
             self._spinner.hide()
@@ -1524,6 +1594,27 @@ class StatusOverlay(QWidget):
             self._bars_widget.reset()
             self.hide()
 
+    def show_info(self, text: str, seconds: int = 4) -> None:
+        """Нейтральный toast — «Распознавание отменено» и подобное (T-405).
+
+        Отдельно от `show_error`: отмена по своей же кнопке не сбой, и красная
+        плашка на неё выглядела бы как «что-то сломалось».
+        """
+        self._dot_anim_timer.stop()
+        self._spinner_timer.stop()
+        self._spinner.hide()
+        self._dot.hide()
+        self._check.hide()
+        self._bars_widget.hide()
+        self._time.hide()
+        self._sep.hide()
+        self._cancel_btn.hide()
+        self._label.setText(text if len(text) <= 90 else text[:88].rstrip() + "…")
+        self._position_bottom()
+        self.show()
+        self.raise_()
+        QTimer.singleShot(max(1, int(seconds)) * 1000, self._hide_if_error)
+
     def show_error(self, text: str, seconds: int = 12) -> None:
         """Красный toast с текстом сбоя (T-404).
 
@@ -1539,6 +1630,7 @@ class StatusOverlay(QWidget):
         self._bars_widget.hide()
         self._time.hide()
         self._sep.hide()
+        self._cancel_btn.hide()
         self._dot.show()
         self._dot.setStyleSheet(
             "color: #DC2626; font-size: 13px; font-weight: bold; background: transparent;"
@@ -1859,9 +1951,10 @@ class _PrimaryActionButton(QFrame):
     transcribing:[spinner] Транскрибирую…       02.4s
     """
 
-    def __init__(self, on_click, parent=None):
+    def __init__(self, on_click, on_cancel=None, parent=None):
         super().__init__(parent)
         self._on_click = on_click
+        self._on_cancel = on_cancel  # T-405: «Отменить» во время распознавания
         self._state = "idle"
         self.setFixedHeight(44)
         self.setCursor(Qt.PointingHandCursor)
@@ -1910,9 +2003,37 @@ class _PrimaryActionButton(QFrame):
         lay.addWidget(self._time)
         lay.addWidget(self._eq)
 
+        # T-405: выход из ожидания. Отдельная кнопка, а не клик по всей плашке:
+        # промахнуться мимо мыши на «Записать» легко, а отмена — необратимая для
+        # текущего прогона операция.
+        self._cancel_btn = QPushButton("Отменить")
+        self._cancel_btn.setObjectName("btn_cancel_inline")
+        self._cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton#btn_cancel_inline {"
+            " background-color: #FFFFFF; border: 1px solid #D97706; border-radius: 14px;"
+            " color: #92400E; font-size: 12.5px; font-weight: 500; padding: 0 14px;"
+            " min-height: 28px; max-height: 28px; }"
+            "QPushButton#btn_cancel_inline:hover { background-color: #FEF3C7; }"
+            "QPushButton#btn_cancel_inline:disabled { color: #C4C4C8; border-color: #E7E7EA; }"
+        )
+        self._cancel_btn.clicked.connect(self._emit_cancel)
+        self._cancel_btn.hide()
+        lay.addWidget(self._cancel_btn)
+
+    def _emit_cancel(self) -> None:
+        if self._on_cancel:
+            self._on_cancel()
+
+    def show_cancelling(self) -> None:
+        """Отмена уже нажата: ждём, пока worker дойдёт до точки выхода."""
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Останавливаю…")
+        self._label.setText("Останавливаю…")
+
     def mousePressEvent(self, ev):
         if self._state == "transcribing":
-            return  # disabled во время транскрипции
+            return  # клик по плашке во время транскрипции ничего не делает (см. «Отменить»)
         if self._on_click:
             self._on_click()
 
@@ -1946,6 +2067,7 @@ class _PrimaryActionButton(QFrame):
             self._time.show()
             self._eq.show()
             self._eq.reset()
+            self._cancel_btn.hide()
             self.setCursor(Qt.PointingHandCursor)
         elif state == "transcribing":
             self.setStyleSheet(
@@ -1968,6 +2090,9 @@ class _PrimaryActionButton(QFrame):
             self._time.setText("")
             self._time.hide()
             self._eq.hide()
+            self._cancel_btn.setEnabled(True)
+            self._cancel_btn.setText("Отменить")
+            self._cancel_btn.setVisible(self._on_cancel is not None)
             self.setCursor(Qt.ArrowCursor)
         else:  # idle
             self.setStyleSheet(
@@ -1999,6 +2124,7 @@ class _PrimaryActionButton(QFrame):
             self._time.setText("")
             self._time.hide()
             self._eq.hide()
+            self._cancel_btn.hide()
             self.setCursor(Qt.PointingHandCursor)
 
     def update_audio_level(self, level: float) -> None:
@@ -2349,6 +2475,12 @@ class SettingsDialog(QDialog):
             " QKeySequenceEdit#settings_input:focus, QKeySequenceEdit#settings_input_mono:focus,"
             " QSpinBox#numfield:focus { border-color: #18181B; }"
             " QSpinBox#numfield { max-width: 96px; }"
+            " QComboBox#settings_input {"
+            "   background: #FFFFFF; border: 1px solid #E7E7EA; border-radius: 8px;"
+            "   padding: 0 12px; color: #18181B; font-size: 13px;"
+            "   min-height: 32px; max-height: 34px;"
+            "   font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif; }"
+            " QComboBox#settings_input:hover { border-color: #D4D4D8; }"
             " QPushButton#btn_outline {"
             "   background-color: #FFFFFF; border: 1px solid #E7E7EA; border-radius: 17px;"
             "   padding: 0 16px; color: #18181B; font-size: 13px; font-weight: 500;"
@@ -2400,6 +2532,20 @@ class SettingsDialog(QDialog):
 
         self.path_edit = QLineEdit(current["history_dir"])
         self.path_edit.setObjectName("settings_input_mono")
+
+        # T-418: выбор микрофона переехал сюда из мастера первого запуска.
+        # В мастер человек заходит один раз, а устройство меняется само —
+        # после переустановки Windows, подключения гарнитуры, смены дефолта.
+        self.mic_combo = QComboBox()
+        self.mic_combo.setObjectName("settings_input")
+        # Имена драйверов бывают в полсотни символов («Головной телефон
+        # (@System32\driversthhfenum.sys…)»), и по умолчанию QComboBox
+        # растягивает под самое длинное — диалог уезжал бы в горизонтальный
+        # скролл вместе с кнопкой «Проверить».
+        self.mic_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.mic_combo.setMinimumContentsLength(24)
+        self.mic_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._fill_mic_combo(current.get("mic_device", "") or "")
 
         # Словарь: слова, имена и термины, которые модель путает. Из коробки
         # пусто — приложение не знает, чем занят конкретный пользователь.
@@ -2663,6 +2809,36 @@ class SettingsDialog(QDialog):
         hint.setWordWrap(True)
         gh.addWidget(hint, 1, 1)
         body_v.addLayout(gh)
+
+        # frow_mic: label / combo / кнопка проверки + строка вывода (T-418).
+        # Кнопка нужна ровно потому, что список устройств правды о сигнале не
+        # знает: узкополосный источник называется как обычный микрофон и
+        # открывается на 48 кГц без единой ошибки. Отличает их только замер.
+        gmic = _QGrid()
+        gmic.setContentsMargins(0, 0, 0, 0)
+        gmic.setHorizontalSpacing(8)
+        gmic.setVerticalSpacing(6)
+        gmic.setColumnMinimumWidth(0, 150)
+        gmic.setColumnStretch(1, 1)
+        lbl_mic = QLabel("Микрофон:")
+        lbl_mic.setObjectName("frow_label")
+        gmic.addWidget(lbl_mic, 0, 0)
+        gmic.addWidget(self.mic_combo, 0, 1)
+        self.mic_check_btn = QPushButton("Проверить")
+        self.mic_check_btn.setObjectName("btn_outline")
+        self.mic_check_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_check_btn.setToolTip(
+            "Запишет 3 секунды с выбранного устройства и скажет, широкая ли "
+            "полоса. Говорите в микрофон, пока идёт замер."
+        )
+        self.mic_check_btn.clicked.connect(self._on_check_mic)
+        gmic.addWidget(self.mic_check_btn, 0, 2)
+        self.mic_hint = QLabel(self._mic_hint_text())
+        self.mic_hint.setObjectName("frow_hint")
+        self.mic_hint.setWordWrap(True)
+        gmic.addWidget(self.mic_hint, 1, 1, 1, 2)
+        self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
+        body_v.addLayout(gmic)
 
         # frow_folder: label / input / browse-btn
         gf = _QGrid()
@@ -3050,6 +3226,76 @@ class SettingsDialog(QDialog):
             tail = ""
         self.dict_counter.setText(f"{n} / {budget} токенов{suffix}{tail}")
 
+    def _fill_mic_combo(self, chosen: str) -> None:
+        """Заполнить список устройств записи.
+
+        Первый пункт — «Системный», и в его подписи стоит имя того, что
+        системным считает Windows прямо сейчас: без него «системный» не
+        отличить от «не тот микрофон».
+        """
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        default_name = audio_quality.default_input_name()
+        self.mic_combo.addItem(
+            f"Системный микрофон — {default_name}" if default_name else "Системный микрофон", ""
+        )
+        for dev in audio_quality.input_devices():
+            self.mic_combo.addItem(dev["name"], dev["name"])
+        if chosen:
+            idx = self.mic_combo.findData(chosen)
+            if idx < 0:
+                # Устройство отключено — показываем строкой, а не молча
+                # откатываемся на «системный»: иначе чужой выбор выглядел бы
+                # как свой, а именно эта подмена и портит записи.
+                self.mic_combo.addItem(f"{chosen} — не подключён", chosen)
+                idx = self.mic_combo.count() - 1
+            self.mic_combo.setCurrentIndex(idx)
+        else:
+            self.mic_combo.setCurrentIndex(0)
+        self.mic_combo.blockSignals(False)
+
+    def _mic_hint_text(self) -> str:
+        return (
+            "Пусто — пишем тем, что выбрано в Windows. После переустановки системы "
+            "или подключения гарнитуры это меняется само: «Проверить» покажет, "
+            "широкая ли полоса у сигнала (вебка и Bluetooth-гарнитура режут её на 8 кГц)."
+        )
+
+    def _on_mic_changed(self) -> None:
+        self.mic_hint.setStyleSheet("")
+        self.mic_hint.setText(self._mic_hint_text())
+
+    def _on_check_mic(self) -> None:
+        """Записать 3 секунды с выбранного устройства и показать вывод.
+
+        Пишем на 48 кГц: на 16 кГц верхней полосы нет ни у какого источника, и
+        замер потерял бы смысл. Устройство не открылось — так и говорим, это
+        тоже ответ на вопрос «почему записи тихие».
+        """
+        import sounddevice as sd
+
+        name = self.mic_combo.currentData() or ""
+        index = audio_quality.resolve_device_index(name) if name else None
+        self.mic_check_btn.setEnabled(False)
+        self.mic_hint.setStyleSheet("color: #92400E; font-size: 12px;")
+        self.mic_hint.setText("Идёт замер, говорите в микрофон…")
+        QApplication.processEvents()
+        try:
+            rate = 48000
+            data = sd.rec(int(3 * rate), samplerate=rate, channels=1,
+                          dtype="float32", device=index)
+            sd.wait()
+            check = audio_quality.check_samples(data[:, 0], rate)
+        except Exception as exc:
+            self.mic_hint.setStyleSheet("color: #DC2626; font-size: 12px;")
+            self.mic_hint.setText(f"Устройство не открылось: {exc}")
+            return
+        finally:
+            self.mic_check_btn.setEnabled(True)
+        colour = "#DC2626" if check.narrowband else ("#A1A1AA" if check.measured else "#92400E")
+        self.mic_hint.setStyleSheet(f"color: {colour}; font-size: 12px;")
+        self.mic_hint.setText(audio_quality.describe(check, hifi=self.hifi_box.isChecked()))
+
     def _hifi_counter_text(self, history_dir: str) -> str:
         """«Накоплено N из 180 мин» — по факту WAV в папке-карантине (T-389).
 
@@ -3245,6 +3491,7 @@ class SettingsDialog(QDialog):
             "custom_model": self._current_custom_model,
             "hotkey": self._hotkey_canonical(),
             "history_dir": self.path_edit.text().strip(),
+            "mic_device": (self.mic_combo.currentData() or ""),  # T-418: пусто = системный
             "rotation_count": int(self.count_spin.value()),
             "autostart": bool(self.autostart_box.isChecked()),
             "start_minimized": bool(self.startmin_box.isChecked()),
@@ -3502,13 +3749,22 @@ class ModelCard(QFrame):
     download_requested = Signal(str)
     delete_requested = Signal(str)
     forget_requested = Signal(str)  # убрать свою модель из списка
+    cancel_requested = Signal(str)  # T-405: прервать скачивание этой модели
 
     def __init__(self, info: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.spec: str = info["spec"]
         self._downloaded = bool(info.get("downloaded"))
         self._active = bool(info.get("active"))
-        self.setObjectName("model_card_active" if self._active else "model_card")
+        # T-405: «выбрана» и «готова к работе» — разные вещи. Раньше флаги были
+        # независимы, и модель без весов на диске несла бейдж «✓ Активная» рядом
+        # с кнопкой «Скачать» — два противоречащих сигнала в одной карточке.
+        self._ready = self._active and self._downloaded
+        self.setObjectName(
+            "model_card_active" if self._ready
+            else "model_card_pending" if self._active
+            else "model_card"
+        )
         self.setCursor(Qt.PointingHandCursor if self._downloaded and not self._active else Qt.ArrowCursor)
 
         root = QVBoxLayout(self)
@@ -3522,9 +3778,17 @@ class ModelCard(QFrame):
             "font-size: 14px; font-weight: 600; color: #18181B; background: transparent;"
         )
         top.addWidget(title)
-        if self._active:
+        if self._ready:
             badge = QLabel("✓ Активная")
             badge.setObjectName("model_badge_active")
+            top.addWidget(badge)
+        elif self._active:
+            badge = QLabel("Выбрана · не скачана")
+            badge.setObjectName("model_badge_pending")
+            badge.setToolTip(
+                "Эта модель выбрана в настройках, но её весов нет на диске — "
+                "распознавать пока нечем. Нажми «Скачать»."
+            )
             top.addWidget(badge)
         top.addStretch()
         for label, val in (("точность", info.get("accuracy", 0)), ("скорость", info.get("speed", 0))):
@@ -3558,10 +3822,19 @@ class ModelCard(QFrame):
         self.progress = QProgressBar()
         self.progress.setObjectName("model_progress")
         self.progress.setTextVisible(True)
-        self.progress.setFixedWidth(190)
+        # Шире прежних 190: в строку теперь помещается не только «X / Y МБ», но и
+        # скорость с остатком — без этого текст обрезался бы многоточием.
+        self.progress.setFixedWidth(300)
         self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         bottom.addWidget(self.progress)
+
+        self.cancel_btn = QPushButton("Отменить")
+        self.cancel_btn.setObjectName("btn_link")
+        self.cancel_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self.spec))
+        self.cancel_btn.setVisible(False)
+        bottom.addWidget(self.cancel_btn)
 
         if not self._downloaded:
             size_mb = int(info.get("size_mb") or 0)
@@ -3599,6 +3872,14 @@ class ModelCard(QFrame):
             bottom.addWidget(forget_btn)
         root.addLayout(bottom)
 
+        # T-405: итог скачивания остаётся на экране — «готова», «отменено,
+        # скачано X из Y», текст ошибки. Раньше шкала просто исчезала, и чем
+        # кончилось дело, человек не узнавал вовсе.
+        self.result_label = QLabel("")
+        self.result_label.setWordWrap(True)
+        self.result_label.setVisible(False)
+        root.addWidget(self.result_label)
+
     def mousePressEvent(self, ev) -> None:  # noqa: N802 — клик по карточке = выбрать
         # T-269: базовую обработку делаем ДО эмита. Сигнал доставляется синхронно,
         # `ModelsDialog._activate` пересобирает список — карточка сносит саму себя
@@ -3610,18 +3891,51 @@ class ModelCard(QFrame):
             self.activate_requested.emit(self.spec)
             return  # после эмита `self` может быть уже помечен к удалению
 
-    def show_progress(self, done: int, total: int) -> None:
+    def show_progress(self, done: int, total: int, text: str = "", stalled: bool = False) -> None:
+        """Шкала скачивания. `text` — готовая строка от `engine.DownloadProgress`.
+
+        T-405: при неизвестном размере шкала больше не уходит в бесконечную
+        анимацию безусловно — на застрявшей закачке она замирает на месте, и
+        текст говорит, сколько секунд нет данных. Бегущая полоса на мёртвой
+        закачке — ровно то, из-за чего «качается» и «не качается» выглядели
+        одинаково.
+        """
         self.progress.setVisible(True)
+        self.result_label.setVisible(False)
+        self.cancel_btn.setVisible(True)
         if hasattr(self, "dl_btn"):
             self.dl_btn.setEnabled(False)
             self.dl_btn.setText("Качаю…")
+        label = text or (
+            f"{done / 1e6:.0f} / {total / 1e6:.0f} МБ" if total > 0 else f"{done / 1e6:.0f} МБ"
+        )
         if total > 0:
             self.progress.setRange(0, 100)
             self.progress.setValue(int(done * 100 / total))
-            self.progress.setFormat(f"{done / 1e6:.0f} / {total / 1e6:.0f} МБ")
+        elif stalled:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
         else:
             self.progress.setRange(0, 0)
-            self.progress.setFormat(f"{done / 1e6:.0f} МБ")
+        self.progress.setFormat(label)
+
+    def show_cancelling(self) -> None:
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Останавливаю…")
+
+    def show_result(self, kind: str, text: str) -> None:
+        """Итог скачивания в карточке: `ok` | `cancelled` | `error`."""
+        self.progress.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        if hasattr(self, "dl_btn"):
+            self.dl_btn.setEnabled(True)
+            self.dl_btn.setText("⭳ Докачать" if kind == "cancelled" else "⭳ Скачать")
+        color = {"ok": "#15803D", "cancelled": "#92400E"}.get(kind, "#B91C1C")
+        self.result_label.setStyleSheet(
+            f"font-size: 12px; color: {color}; background: transparent;"
+        )
+        self.result_label.setText(text)
+        self.result_label.setVisible(bool(text))
 
 
 class _AddCustomModelDialog(QDialog):
@@ -3710,6 +4024,7 @@ class ModelsDialog(QDialog):
 
     _dl_progress = Signal(str, int, int)  # spec, done, total
     _dl_finished = Signal(str, str)       # spec, error ("" — успех)
+    _dl_cancelled = Signal(str, int, int)  # T-405: spec, скачано, всего
 
     def __init__(self, parent: QWidget | None, current: dict, model_locked: bool = False) -> None:
         super().__init__(parent)
@@ -3723,6 +4038,11 @@ class ModelsDialog(QDialog):
             self._customs.append(legacy)
         self._cards: dict[str, ModelCard] = {}
         self._downloading: set[str] = set()
+        # T-405: состояние закачек живёт в диалоге, а не в карточках — карточки
+        # пересобираются (`_rebuild`), и вместе с ними умирал бы весь прогресс.
+        self._dl_cancel: set[str] = set()                       # нажали «Отменить»
+        self._dl_track: dict[str, engine.DownloadProgress] = {}  # скорость / остаток / застой
+        self._dl_results: dict[str, tuple[str, str]] = {}        # чем кончилось: kind, текст
 
         self.setWindowTitle("Модели транскрипции")
         self.setMinimumSize(720, 600)
@@ -3733,8 +4053,13 @@ class ModelsDialog(QDialog):
               " QFrame#model_card:hover { border-color: #D4D4D8; }"
               " QFrame#model_card_active { background: #FFFFFF; border: 1.5px solid #18181B;"
               "   border-radius: 12px; }"
+              " QFrame#model_card_pending { background: #FFFFFF; border: 1.5px dashed #D97706;"
+              "   border-radius: 12px; }"
               " QLabel#model_badge_active { background: #18181B; color: #FFFFFF;"
               "   border-radius: 9px; padding: 2px 9px; font-size: 11px; font-weight: 600; }"
+              " QLabel#model_badge_pending { background: #FEF3C7; color: #92400E;"
+              "   border: 1px solid #FDE68A; border-radius: 9px; padding: 2px 9px;"
+              "   font-size: 11px; font-weight: 600; }"
               " QLabel#section_title { font-size: 13px; font-weight: 600; color: #52525B; }"
               " QPushButton#btn_primary_sm { background-color: #18181B; border: 1px solid #18181B;"
               "   border-radius: 15px; padding: 0 16px; color: #FFFFFF; font-size: 12.5px;"
@@ -3804,6 +4129,13 @@ class ModelsDialog(QDialog):
 
         self._dl_progress.connect(self._on_dl_progress)
         self._dl_finished.connect(self._on_dl_finished)
+        self._dl_cancelled.connect(self._on_dl_cancelled)
+        # T-405: тик раз в секунду. Нужен именно таймер, а не колбэк прогресса:
+        # когда байты перестали приходить, колбэка нет вообще — а сказать «нет
+        # данных N сек» надо как раз тогда.
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._refresh_download_labels)
         self._rebuild()
 
     # --- сборка списка ---
@@ -3870,10 +4202,24 @@ class ModelsDialog(QDialog):
                 card.download_requested.connect(self._download)
                 card.delete_requested.connect(self._delete)
                 card.forget_requested.connect(self._forget_custom)
+                card.cancel_requested.connect(self._cancel_download)
                 self._cards[e["spec"]] = card
                 v.addWidget(card)
-                if e["spec"] in self._downloading:
-                    card.show_progress(0, 0)
+                spec = e["spec"]
+                if spec in self._downloading:
+                    # T-405: пересобранная карточка подхватывает живую закачку —
+                    # прогресс живёт в диалоге, а не в самой карточке.
+                    tracker = self._dl_track.get(spec)
+                    if tracker is not None:
+                        card.show_progress(tracker.done, tracker.total,
+                                           tracker.text(), tracker.stalled())
+                    else:
+                        card.show_progress(0, 0)
+                    if spec in self._dl_cancel:
+                        card.show_cancelling()
+                elif spec in self._dl_results:
+                    kind, text = self._dl_results[spec]
+                    card.show_result(kind, text)
         v.addStretch()
         # T-269: `QScrollArea.setWidget` удаляет прежний виджет НЕМЕДЛЕННО, вместе
         # со всеми карточками — а вызвать нас могли изнутри клика по одной из них.
@@ -3922,39 +4268,98 @@ class ModelsDialog(QDialog):
         if spec in self._downloading:
             return
         self._downloading.add(spec)
+        self._dl_cancel.discard(spec)
+        self._dl_results.pop(spec, None)
+        tracker = engine.DownloadProgress()
+        self._dl_track[spec] = tracker
         card = self._cards.get(spec)
         if card is not None:
-            card.show_progress(0, 0)
+            card.show_progress(0, 0, "Начинаю…")
+        self._tick.start()
 
         def _worker() -> None:
             try:
                 engine.ensure_downloaded(
                     spec,
                     progress_cb=lambda d, t: self._dl_progress.emit(spec, int(d), int(t)),
+                    should_cancel=lambda: spec in self._dl_cancel,
                 )
                 self._dl_finished.emit(spec, "")
+            except engine.DownloadCancelled as exc:
+                self._dl_cancelled.emit(spec, exc.done_bytes, exc.total_bytes)
+            except engine.ModelDownloadError as exc:
+                self._dl_finished.emit(spec, exc.full_text())
             except Exception as exc:
                 self._dl_finished.emit(spec, f"{exc.__class__.__name__}: {exc}")
 
         threading.Thread(target=_worker, daemon=True, name=f"model-dl-{spec}").start()
 
-    @Slot(str, int, int)
-    def _on_dl_progress(self, spec: str, done: int, total: int) -> None:
+    def _cancel_download(self, spec: str) -> None:
+        """Остановить скачивание. Уже скачанное с диска не сносим — это докачка."""
+        if spec not in self._downloading:
+            return
+        self._dl_cancel.add(spec)
         card = self._cards.get(spec)
         if card is not None:
-            card.show_progress(done, total)
+            card.show_cancelling()
+
+    def _refresh_download_labels(self) -> None:
+        """Раз в секунду переписать строку шкалы: скорость, остаток, застой."""
+        if not self._downloading:
+            self._tick.stop()
+            return
+        for spec in list(self._downloading):
+            tracker = self._dl_track.get(spec)
+            card = self._cards.get(spec)
+            if tracker is None or card is None:
+                continue
+            if spec in self._dl_cancel:
+                continue  # там уже «Останавливаю…», перетирать не надо
+            card.show_progress(tracker.done, tracker.total, tracker.text(), tracker.stalled())
+
+    @Slot(str, int, int)
+    def _on_dl_progress(self, spec: str, done: int, total: int) -> None:
+        tracker = self._dl_track.get(spec)
+        card = self._cards.get(spec)
+        if tracker is not None:
+            tracker.feed(done, total)
+        if card is not None and spec not in self._dl_cancel:
+            text = tracker.text() if tracker is not None else ""
+            card.show_progress(done, total, text, bool(tracker and tracker.stalled()))
+
+    def _finish_download(self, spec: str, kind: str, text: str) -> None:
+        """Общий хвост любого исхода: снять флаги, оставить итог в карточке."""
+        self._downloading.discard(spec)
+        self._dl_cancel.discard(spec)
+        self._dl_track.pop(spec, None)
+        self._dl_results[spec] = (kind, text)
+        if not self._downloading:
+            self._tick.stop()
 
     @Slot(str, str)
     def _on_dl_finished(self, spec: str, error: str) -> None:
-        self._downloading.discard(spec)
         if error:
+            self._finish_download(spec, "error", error.split("\n")[0])
             self._rebuild()
             QMessageBox.warning(
                 self, "Скачивание модели",
                 f"{engine.spec_display(spec)} не скачалась:\n\n{error}",
             )
             return
+        self._finish_download(spec, "ok", "Модель готова к работе.")
         self._activate(spec) if not self._locked else self._rebuild()
+
+    @Slot(str, int, int)
+    def _on_dl_cancelled(self, spec: str, done: int, total: int) -> None:
+        """Отмена — не сбой: окна с ошибкой нет, итог остаётся строкой в карточке."""
+        if total > 0:
+            text = (f"Отменено — скачано {done / 1e6:.0f} из {total / 1e6:.0f} МБ, "
+                    "они остались на диске. «Докачать» продолжит с места.")
+        else:
+            text = (f"Отменено — скачано {done / 1e6:.0f} МБ, они остались на диске. "
+                    "«Докачать» продолжит с места.")
+        self._finish_download(spec, "cancelled", text)
+        self._rebuild()
 
     def _delete(self, spec: str) -> None:
         repo = (engine.repo_for_spec(spec) or "").lower()
@@ -5126,10 +5531,15 @@ class MainWindow(QMainWindow):
     _call_processing_requested = Signal(bool, float)  # (active, total_audio_sec)
     _call_progress_requested = Signal(float)          # грубый прогресс транскрипта 0..1
     _note_text_requested = Signal(str)  # T-352: thread-safe доставка текста диктовки в заметку
+    _hifi_band_requested = Signal(bool, str, str)  # T-418: (узкая полоса, микрофон, вывод словами)
     _note_dictation_ended_requested = Signal()  # T-352: гарантированный сброс кнопки на ЛЮБОМ исходе
     # T-404: сбой фоновой работы (модель не скачалась / не загрузилась) — из
     # worker-потока в окно. До этого такие исключения уходили только в _crash.log.
     _error_requested = Signal(str, str, str)  # заголовок, причина, что делать
+    # T-405: отмена распознавания. Первый сигнал — «нажали, ждём выхода worker'а»,
+    # второй — «worker вышел» с текстом для плашки.
+    _cancelling_requested = Signal()
+    _cancelled_requested = Signal(str)
 
     def __init__(
         self,
@@ -5146,9 +5556,14 @@ class MainWindow(QMainWindow):
         toggle_note_recording_via_ui: Callable[[], None] | None = None,
         model_busy_getter: Callable[[], bool] | None = None,
         file_import_api: "audio_import.FileImportApi | None" = None,
+        cancel_transcription: Callable[[], bool] | None = None,
+        model_missing_getter: Callable[[], str] | None = None,
     ) -> None:
         super().__init__()
         self._model_busy_getter = model_busy_getter  # T-259: занят ли движок прямо сейчас
+        self._cancel_transcription = cancel_transcription  # T-405: прервать распознавание
+        # T-405: «» — модель на месте, иначе текст «чего не хватает» для плашки
+        self._model_missing_getter = model_missing_getter
         self._toggle_note_recording_via_ui = toggle_note_recording_via_ui  # T-352
         self._note_dictation_target = None  # NoteEditorPanel, ждущий текст диктовки
         self._file_import_api = file_import_api  # T-351: движок импорта файла
@@ -5296,8 +5711,14 @@ class MainWindow(QMainWindow):
         self._call_processing_requested.connect(self._on_call_processing)
         self._call_progress_requested.connect(self._on_call_progress)
         self._note_text_requested.connect(self._on_note_text_ready)  # T-352
+        self._hifi_band_requested.connect(self._on_hifi_band)  # T-418: полоса последней hi-fi записи
         self._note_dictation_ended_requested.connect(self._on_note_dictation_ended)  # T-352
         self._error_requested.connect(self._on_error)  # T-404: сбой из worker'а → окно
+        # T-405: отмена распознавания — кнопка живёт и в плашке над таскбаром
+        self._cancelling_requested.connect(self._on_cancelling)
+        self._cancelled_requested.connect(self._on_cancelled)
+        if self._cancel_transcription is not None:
+            self._overlay.set_cancel_handler(self._on_cancel_clicked)
         self.refresh_history()
 
     @Slot(float)
@@ -5327,6 +5748,24 @@ class MainWindow(QMainWindow):
         callback'а (отдельный thread). Throttle на стороне вызывающего."""
         self._audio_level_requested.emit(level)
 
+    def notify_hifi_band(self, narrowband: bool, mic: str, text: str) -> None:
+        """T-418: вывод о полосе последней hi-fi записи — из потока стопа записи."""
+        self._hifi_band_requested.emit(bool(narrowband), str(mic), str(text))
+
+    @Slot(bool, str, str)
+    def _on_hifi_band(self, narrowband: bool, mic: str, text: str) -> None:
+        """Запомнить вывод и перерисовать полосу.
+
+        Держим только последний результат: узкая полоса — это состояние
+        железа, а не событие. Сменил микрофон, наговорил заново — полоса
+        перекрасится сама, отдельного «закрыть» не нужно.
+        """
+        self._hifi_band_warning = (mic, text) if narrowband else None
+        try:
+            self._refresh_hifi_bar(self._history_dir_getter())
+        except Exception:
+            pass
+
     # === T-172: thread-safe API режима записи созвона (emit из worker/watchdog) ===
     def notify_call_state(self, active: bool) -> None:
         """Thread-safe смена вида кнопки созвона (idle/активна)."""
@@ -5352,6 +5791,37 @@ class MainWindow(QMainWindow):
         """T-352: thread-safe доставка результата диктовки-в-заметку из worker
         thread'а (`_stop_thread` → `stop_recording_and_transcribe`)."""
         self._note_text_requested.emit(text or "")
+
+    def notify_cancelling(self) -> None:
+        """Thread-safe: отмена принята, показываем «Останавливаю…» (T-405)."""
+        self._cancelling_requested.emit()
+
+    def notify_cancelled(self, text: str) -> None:
+        """Thread-safe: worker вышел по отмене — сообщить и вернуть готовность."""
+        self._cancelled_requested.emit(text)
+
+    @Slot()
+    def _on_cancelling(self) -> None:
+        self._overlay.show_cancelling()
+        if hasattr(self, "action_btn"):
+            self.action_btn.show_cancelling()
+        if hasattr(self, "_cancel_action"):
+            self._cancel_action.setEnabled(False)
+
+    @Slot(str)
+    def _on_cancelled(self, text: str) -> None:
+        # Плашку показываем ПОСЛЕ set_state('idle') — тот прячет overlay целиком,
+        # и порядок «сначала текст, потом idle» съедал бы сообщение. Поэтому
+        # ставим её отложенно, следующим тиком очереди событий.
+        QTimer.singleShot(0, lambda: self._overlay.show_info(text))
+
+    def _on_cancel_clicked(self) -> None:
+        if self._cancel_transcription is None:
+            return
+        try:
+            self._cancel_transcription()
+        except Exception as exc:  # noqa: BLE001 — кнопка не должна ронять окно
+            print(f"[ui] cancel fail: {exc}", file=sys.stderr, flush=True)
 
     def notify_error(self, title: str, text: str, hint: str = "") -> None:
         """T-404: thread-safe показ сбоя фоновой работы.
@@ -5566,6 +6036,7 @@ class MainWindow(QMainWindow):
 
         self.action_btn = _PrimaryActionButton(
             on_click=self._on_record_clicked,
+            on_cancel=self._on_cancel_clicked if self._cancel_transcription else None,
         )
         top_row.addWidget(self.action_btn, 1)
 
@@ -5668,6 +6139,9 @@ class MainWindow(QMainWindow):
         # вопрос «сколько уже накопил» только тому, кто туда зашёл; включённый
         # режим меняет то, что происходит с каждой записью, и должен быть виден
         # из главного окна — иначе о нём забывают включённым.
+        # T-418: последняя hi-fi запись пришла с узкополосного источника —
+        # (микрофон, вывод словами). None — всё в порядке.
+        self._hifi_band_warning: "tuple[str, str] | None" = None
         self._hifi_bar = QWidget()
         self._hifi_bar.setStyleSheet("background: #FEF3C7; border-bottom: 1px solid #FDE68A;")
         _hifi_row = QHBoxLayout(self._hifi_bar)
@@ -5682,6 +6156,34 @@ class MainWindow(QMainWindow):
         _hifi_row.addStretch()
         self._hifi_bar.setVisible(False)
         layout.addWidget(self._hifi_bar)
+
+        # === T-405: полоса «модель не скачана» ===
+        # Пока весов нет, диктовать нечем — и узнавать об этом в момент, когда
+        # уже наговорил, поздно. Полоса висит до тех пор, пока модель не
+        # появится на диске, и ведёт ровно туда, где её качают.
+        self._nomodel_bar = QWidget()
+        self._nomodel_bar.setStyleSheet("background: #FEE2E2; border-bottom: 1px solid #FCA5A5;")
+        _nm_row = QHBoxLayout(self._nomodel_bar)
+        _nm_row.setContentsMargins(20, 7, 20, 7)
+        _nm_row.setSpacing(10)
+        self._nomodel_label = QLabel()
+        self._nomodel_label.setWordWrap(True)
+        self._nomodel_label.setStyleSheet(
+            "color: #991B1B; font-size: 12px; background: transparent;"
+            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
+        )
+        _nm_row.addWidget(self._nomodel_label, 1)
+        _nm_open = QPushButton("Открыть «Модели»")
+        _nm_open.setCursor(Qt.PointingHandCursor)
+        _nm_open.setStyleSheet(
+            "QPushButton { background: #FFFFFF; border: 1px solid #FCA5A5; border-radius: 13px;"
+            " color: #991B1B; font-size: 12px; padding: 0 12px; min-height: 26px; max-height: 26px; }"
+            "QPushButton:hover { background: #FEF2F2; }"
+        )
+        _nm_open.clicked.connect(self.open_models)
+        _nm_row.addWidget(_nm_open)
+        self._nomodel_bar.setVisible(False)
+        layout.addWidget(self._nomodel_bar)
 
         # === Скролл-список карточек (full-width, padding внутри 20/12/10/12) ===
         # right=10 чтобы card.right выровнялся с правым краем top buttons.
@@ -5800,7 +6302,14 @@ class MainWindow(QMainWindow):
         donate_action.triggered.connect(lambda: self.open_donate())
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(self._quit)
+        # T-405: выход из ожидания, когда окно закрыто. Пункт всегда на месте
+        # (меню, в котором элементы появляются и исчезают, читается как глюк),
+        # но живой только во время распознавания.
+        self._cancel_action = QAction("Отменить распознавание", self)
+        self._cancel_action.setEnabled(False)
+        self._cancel_action.triggered.connect(lambda: self._on_cancel_clicked())
         menu.addAction(open_action)
+        menu.addAction(self._cancel_action)
         menu.addAction(settings_action)
         menu.addAction(about_action)
         menu.addAction(donate_action)
@@ -5839,6 +6348,10 @@ class MainWindow(QMainWindow):
         self._state = state
         self._overlay.show_state(state)
         self.action_btn.set_state(state)
+        if hasattr(self, "_cancel_action"):
+            self._cancel_action.setEnabled(
+                state == "processing" and self._cancel_transcription is not None
+            )
         # Секундомер записи
         if state == "recording":
             self._rec_started_at = _time.monotonic()
@@ -5895,15 +6408,59 @@ class MainWindow(QMainWindow):
             minutes = hifi_accumulated_minutes(history_dir)
         except Exception:
             minutes = 0.0
-        self._hifi_label.setText(
-            f"Hi-fi диктовка включена · накоплено {minutes:.0f} из {HIFI_TARGET_MINUTES} мин "
-            f"в {profile.HIFI_SUBDIR}\\ — записи в истории остаются обычными"
+        # T-418: имя микрофона — в самой полосе. Раньше узнать, куда уходит
+        # голос, можно было только через мастер первого запуска, и подмена
+        # системного устройства три дня оставалась незамеченной.
+        mic = current_mic_name()
+        warning = getattr(self, "_hifi_band_warning", None)
+        if warning:
+            self._hifi_bar.setStyleSheet(
+                "background: #FEE2E2; border-bottom: 1px solid #FECACA;"
+            )
+            self._hifi_label.setStyleSheet(
+                "color: #991B1B; font-size: 12px; background: transparent;"
+                " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
+            )
+            self._hifi_label.setText(
+                f"Hi-fi: микрофон «{warning[0]}» — {warning[1]} "
+                f"Накоплено {minutes:.0f} из {HIFI_TARGET_MINUTES} мин."
+            )
+            return
+        self._hifi_bar.setStyleSheet("background: #FEF3C7; border-bottom: 1px solid #FDE68A;")
+        self._hifi_label.setStyleSheet(
+            "color: #92400E; font-size: 12px; background: transparent;"
+            " font-family: 'Segoe UI Variable Display','Segoe UI',sans-serif;"
         )
+        self._hifi_label.setText(
+            f"Hi-fi диктовка включена · микрофон: {mic} · накоплено {minutes:.0f} "
+            f"из {HIFI_TARGET_MINUTES} мин в {profile.HIFI_SUBDIR}\\ — "
+            "записи в истории остаются обычными"
+        )
+
+    def refresh_nomodel_bar(self) -> None:
+        """T-405: показать / убрать полосу «модель не скачана».
+
+        Зовётся на каждом обновлении истории (открытие окна, конец диктовки) и
+        после закрытия раздела «Модели» — то есть в каждой точке, где состояние
+        весов могло измениться.
+        """
+        if not hasattr(self, "_nomodel_bar"):
+            return
+        reason = ""
+        if self._model_missing_getter is not None:
+            try:
+                reason = self._model_missing_getter() or ""
+            except Exception:
+                reason = ""
+        self._nomodel_bar.setVisible(bool(reason))
+        if reason:
+            self._nomodel_label.setText(reason)
 
     def refresh_history(self) -> None:
         history_dir = self._history_dir_getter()
         count = self._rotation_count_getter()
         self._refresh_hifi_bar(history_dir)
+        self.refresh_nomodel_bar()
         self._entries = read_history_entries(history_dir, count)
         # T-173 A: транскрипты созвонов из Calls\ (вне ротации надиктовок, T-174)
         self._call_entries = read_call_entries(history_dir / "Calls", CALL_CARDS_MAX)
@@ -6116,6 +6673,9 @@ class MainWindow(QMainWindow):
         dlg = ModelsDialog(self, before, model_locked=locked)
         dlg.exec()
         after = load_settings_dict()
+        # T-405: веса могли появиться (или уехать через «Удалить») — полоса
+        # «модель не скачана» обязана это увидеть, даже если сама модель та же.
+        self.refresh_nomodel_bar()
         if (after.get("model"), after.get("custom_model")) != (
             before.get("model"), before.get("custom_model")
         ):

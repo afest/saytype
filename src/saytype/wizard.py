@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import cuda_layer, engine
+from .audio_quality import input_devices
 from .transcribe_ui_window import (
     DEFAULT_HOTKEY,
     hotkey_to_canonical,
@@ -106,34 +107,6 @@ def system_language() -> str:
     except Exception:
         code = ""
     return "ru" if code.lower().startswith(("ru", "russian")) else "en"
-
-
-def input_devices() -> list[dict]:
-    """Устройства записи: `{index, name, default}`, без дублей по имени.
-
-    sounddevice показывает одно физическое устройство несколько раз (MME,
-    DirectSound, WASAPI). Человеку в списке нужен микрофон, а не хост-API,
-    поэтому оставляем первое вхождение каждого имени.
-    """
-    out: list[dict] = []
-    seen: set[str] = set()
-    try:
-        default_idx = sd.default.device[0]
-    except Exception:
-        default_idx = None
-    try:
-        devices = sd.query_devices()
-    except Exception:
-        return out
-    for idx, dev in enumerate(devices):
-        if int(dev.get("max_input_channels", 0)) <= 0:
-            continue
-        name = str(dev.get("name", "")).strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        out.append({"index": idx, "name": name, "default": idx == default_idx})
-    return out
 
 
 class _LevelMeter(QWidget):

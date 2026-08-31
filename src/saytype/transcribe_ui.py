@@ -173,6 +173,7 @@ from pathlib import Path
 # T-259: engine — единственная точка загрузки модели. Его импорт настраивает
 # CUDA DLL-пути (Windows), поэтому идёт ДО всего, что тянет ctranslate2.
 from . import audio_import  # T-351: декодер файла + контракт FileImportApi
+from . import audio_quality  # T-418: полоса микрофона и разбор устройств записи
 from . import cuda_layer
 from . import engine
 from . import profile
@@ -487,6 +488,12 @@ _active_hifi: bool = False  # True — запись этой сессии идё
 _auto_timer_generation: int = 0
 _streaming_worker_started: bool = False  # True если в текущей записи реально стартанул LA-2 worker
 
+# T-405: «Отменить» во время распознавания. Флаг ставит GUI-поток (кнопка в окне,
+# пункт tray, кнопка в toast'е), читает worker — между сегментами и в ожидании
+# загрузки модели в VRAM. Событие, а не bool: `wait(timeout)` даёт ожидание,
+# которое прерывается сразу, без опроса в цикле со sleep.
+_cancel_event = threading.Event()
+
 
 class PreRollBuffer:
     """Постоянно работающий sd.InputStream, пишет последние duration_sec аудио
@@ -570,14 +577,29 @@ def mic_device() -> "int | None":
     if not name:
         return None
     try:
-        for idx, dev in enumerate(sd.query_devices()):
-            if int(dev.get("max_input_channels", 0)) > 0 and dev.get("name") == name:
-                return idx
+        idx = audio_quality.resolve_device_index(name)
     except Exception as exc:
         log(f"не смог перечислить устройства записи ({exc!r}) — беру системное")
         return None
-    log(f"микрофон «{name}» не найден — беру системный")
-    return None
+    if idx is None:
+        log(f"микрофон «{name}» не найден — беру системный")
+    return idx
+
+
+def current_mic_name() -> str:
+    """С какого микрофона реально пишем — для лога, полосы и настроек (T-418).
+
+    Выбранное имя показываем как есть; при «системном» спрашиваем Windows, что
+    у неё сейчас системное. Разница между этими двумя ответами и была слепой
+    зоной: настройка не менялась, а устройство за ней — да.
+    """
+    name = (SETTINGS.get("mic_device") or "").strip()
+    if name:
+        return name
+    try:
+        return audio_quality.default_input_name() or "системный"
+    except Exception:
+        return "системный"
 
 
 def log(msg: str) -> None:
@@ -774,6 +796,22 @@ def active_model_spec() -> str:
     return engine.spec_from_settings(SETTINGS)
 
 
+def no_model_reason() -> str:
+    """Почему диктовать нечем, либо "" — модель на месте (T-405).
+
+    Один ответ на два вопроса: что писать в полосе главного окна и чем
+    отвечать на хоткей. Пока проверки не было, нажатие по хоткею на пустом
+    кэше запускало запись, и человек узнавал правду уже наговорив — в конце.
+    """
+    spec = active_model_spec()
+    try:
+        if engine.is_loaded(spec) or engine.is_cached(spec):
+            return ""
+    except Exception:
+        return ""
+    return f"Модель {engine.spec_display(spec)} не скачана — распознавать нечем."
+
+
 def report_error(title: str, text: str, hint: str = "") -> None:
     """Показать сбой человеку (T-404) — окно + toast, а не только `_crash.log`.
 
@@ -791,7 +829,7 @@ def report_error(title: str, text: str, hint: str = "") -> None:
 
 
 def load_model(spec: "str | None" = None, progress_cb=None, force_reload: bool = False,
-               allow_download: bool = True):
+               allow_download: bool = True, should_cancel=None):
     """Обёртка над engine.load_model — кэш модели, double-checked locking и
     fallback-цепочка compute_type живут в engine (T-259, одна точка на проект).
 
@@ -812,7 +850,8 @@ def load_model(spec: "str | None" = None, progress_cb=None, force_reload: bool =
             hint="Открой раздел «Модели» и нажми «Скачать»: там видно прогресс "
                  "и понятно, чем закончилось.",
         )
-    m = engine.load_model(spec, logger=log, progress_cb=progress_cb, force_reload=force_reload)
+    m = engine.load_model(spec, logger=log, progress_cb=progress_cb, force_reload=force_reload,
+                          should_cancel=should_cancel)
     if m is not model:
         _check_prompt_budget(m)
     model = m
@@ -843,7 +882,7 @@ def load_model_background(spec: "str | None" = None, reason: str = "") -> None:
         )
 
 
-def switch_model(spec: str, progress_cb=None):
+def switch_model(spec: str, progress_cb=None, should_cancel=None):
     """Смена модели на лету: выгрузить старую из VRAM → загрузить новую.
 
     Глобальную ссылку `model` обнуляем ДО engine.unload_model() — чтобы никто
@@ -855,9 +894,88 @@ def switch_model(spec: str, progress_cb=None):
     crashguard.mark(f"смена модели → {engine.spec_display(spec)}")
     model = None
     engine.unload_model(logger=log)
-    m = load_model(spec, progress_cb=progress_cb, force_reload=True)
+    m = load_model(spec, progress_cb=progress_cb, force_reload=True, should_cancel=should_cancel)
     crashguard.mark(f"модель сменена на {engine.spec_display(spec)}")
     return m
+
+
+class _TranscriptionCancelled(Exception):
+    """Распознавание прервал сам пользователь (T-405) — не сбой, окна с ошибкой нет."""
+
+
+def cancel_transcription() -> bool:
+    """Прервать идущее распознавание диктовки. False — прерывать нечего.
+
+    Зовётся из GUI-потока: кнопка в окне, пункт tray-меню, кнопка в toast'е.
+    Само прерывание делает worker — между сегментами и в ожидании модели.
+    """
+    if not busy:
+        return False
+    if not _cancel_event.is_set():
+        _cancel_event.set()
+        log("отмена распознавания запрошена")
+        crashguard.mark("отмена распознавания")
+    if window is not None:
+        try:
+            window.notify_cancelling()
+        except Exception as exc:
+            log(f"notify_cancelling fail: {exc}")
+    return True
+
+
+def transcription_cancelling() -> bool:
+    """Идёт ли уже остановка (для UI: кнопку второй раз нажимать незачем)."""
+    return bool(busy and _cancel_event.is_set())
+
+
+def _load_model_cancellable():
+    """Загрузить модель так, чтобы «Отмена» работала и на прогреве CUDA.
+
+    `WhisperModel(...)` — блокирующий вызов внутри CTranslate2: прервать его
+    нечем, а разрушать наполовину поднятую модель нельзя (T-268, процесс умрёт
+    мимо `try/except`). Поэтому грузим в отдельном потоке и ждём его с оглядкой
+    на флаг отмены: по нажатию мы просто перестаём ЖДАТЬ. Поток догружает
+    модель до конца и кладёт её в кэш engine — следующая диктовка стартует уже
+    прогретой, VRAM не течёт, ничего не разрушено.
+
+    Первый прогон после старта — те самые ~18 секунд, ради которых это и
+    сделано: без этого отмена доходила бы до worker'а только после прогрева.
+    """
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["model"] = load_model(allow_download=False)
+        except BaseException as exc:  # noqa: BLE001 — отдаём вызывающему как есть
+            box["error"] = exc
+
+    thread = threading.Thread(target=_work, daemon=True, name="model-load-for-dictation")
+    thread.start()
+    while thread.is_alive():
+        thread.join(0.2)
+        if thread.is_alive() and _cancel_event.is_set():
+            log("отмена на этапе загрузки модели — догрузка продолжится в фоне")
+            raise _TranscriptionCancelled()
+    if "error" in box:
+        raise box["error"]
+    return box.get("model")
+
+
+def _collect_segments(segments) -> str:
+    """Текст из ленивого генератора faster-whisper, с проверкой отмены.
+
+    Модель считает не на вызове `transcribe()`, а на каждой итерации — поэтому
+    выход из цикла и есть остановка работы (тот же приём, что в импорте файла,
+    T-351: иначе длинную запись нечем было бы прервать).
+    """
+    parts: list[str] = []
+    for seg in segments:
+        if _cancel_event.is_set():
+            raise _TranscriptionCancelled()
+        text = (seg.text or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
 
 
 def set_state(state: str) -> None:
@@ -1208,13 +1326,22 @@ def stop_recording_and_transcribe() -> None:
                 log(f"saved hi-fi {hifi_wav.name} ({dur_sec:.1f}s, {_active_rate} Hz)")
             except Exception as exc:
                 log(f"hi-fi save fail: {exc}")
+            # T-418: узкополосный источник (мик вебки, Bluetooth-гарнитура в
+            # режиме Hands-Free) открывается на 48 кГц без ошибки и отдаёт
+            # передискретизованные 16. Настройки при этом честно показывают
+            # «hi-fi 48 000 Гц» — отличить можно только по самому сигналу.
+            _report_hifi_band(hifi_pcm16, _active_rate)
 
     t0 = time.time()
     # T-404: модель грузим только из кэша. Скачивание отсюда запрещено —
     # это поток стопа записи, в нём нет ни шкалы, ни отмены, а на плохом
     # маршруте оно висит минутами и выглядит как зависшая транскрипция.
     try:
-        m = load_model(allow_download=False)
+        # T-405: ждём модель через отдельный поток — иначе прогрев CUDA (~18 сек
+        # на первом прогоне) держал бы кнопку «Отменить» бесполезной.
+        m = _load_model_cancellable()
+    except _TranscriptionCancelled:
+        raise
     except Exception as exc:
         hint = getattr(exc, "hint", "")
         where = f"\n\nЗапись сохранена: {wav_path}" if not note_dictation else ""
@@ -1274,7 +1401,7 @@ def stop_recording_and_transcribe() -> None:
                     # что в full-pass ветке (см. TEMPERATURE_FALLBACK на module-level).
                     temperature=TEMPERATURE_FALLBACK,
                 )
-                head_raw = " ".join(s.text.strip() for s in head_segments).strip()
+                head_raw = _collect_segments(head_segments)
                 # 2026-05-23 фаза 3: whisper на head_audio оборванном на границе
                 # фонетического слова часто ставит «...» — последнее слово ломаное
                 # («сет...» вместо «сейчас»). Обрезаем чтобы dedupe-склейка нашла
@@ -1326,7 +1453,7 @@ def stop_recording_and_transcribe() -> None:
                 # (compression_ratio > 2.4 → следующая temperature).
                 temperature=TEMPERATURE_FALLBACK,
             )
-            tail_raw = " ".join(s.text.strip() for s in segments).strip()
+            tail_raw = _collect_segments(segments)
             tail_elapsed_sec = time.time() - _tail_t0
             info_lang = info.language
         else:
@@ -1361,7 +1488,7 @@ def stop_recording_and_transcribe() -> None:
             condition_on_previous_text=False,  # не подавать loop как контекст следующему сегменту
             language="ru",  # явный язык вместо хинта в initial_prompt (см. INITIAL_PROMPT)
         )
-        raw = " ".join(s.text.strip() for s in segments).strip()
+        raw = _collect_segments(segments)
         info_lang = info.language
 
     text = post_process(raw)
@@ -1554,6 +1681,19 @@ def _stop_thread() -> None:
     was_note = note_dictation
     try:
         stop_recording_and_transcribe()
+    except _TranscriptionCancelled:
+        # T-405: нажали «Отменить». Запись при этом уже лежит на диске (wav
+        # пишется ДО транскрипции) — сообщаем это, а не «не удалось распознать».
+        log("распознавание отменено пользователем")
+        crashguard.mark("распознавание отменено")
+        if window is not None:
+            try:
+                window.notify_cancelled(
+                    "Распознавание отменено"
+                    + ("" if was_note else " — запись осталась в истории")
+                )
+            except Exception as exc:
+                log(f"notify_cancelled fail: {exc}")
     except Exception as exc:
         # T-404: раньше любая авария после стопа записи уходила только в
         # `_crash.log` — иконка возвращалась в серую, и это выглядело как «текст
@@ -1564,6 +1704,7 @@ def _stop_thread() -> None:
             getattr(exc, "hint", "") or _transcribe_failure_hint(exc),
         )
     finally:
+        _cancel_event.clear()  # T-405: флаг живёт ровно один прогон
         set_state("idle")  # гарантия возврата к серой иконке независимо от исходов
         busy = False
         via_ui_request = False
@@ -1581,6 +1722,30 @@ def _stop_thread() -> None:
         # Раньше отметка стояла сразу после m.transcribe, и всё, что шло дальше
         # (сохранение, ротация, автопаст, обновление окна), выглядело простоем.
         crashguard.mark("простой (транскрипция завершена)")
+
+
+def _report_hifi_band(pcm16: "np.ndarray", rate: int) -> None:
+    """Померить полосу сохранённой hi-fi записи и сказать о ней окну и логу.
+
+    Проверка стоит после сохранения, а не до: испортить надиктовку из-за сбоя в
+    измерении нельзя, а сам вывод нужен всё равно постфактум. Тишина и слишком
+    короткая запись вывода не дают — тревога на них была бы ложной.
+    """
+    try:
+        check = audio_quality.check_samples(pcm16.astype(np.float32) / 32767.0, rate)
+    except Exception as exc:
+        log(f"полоса hi-fi не измерена: {exc!r}")
+        return
+    if not check.measured:
+        return
+    mic = current_mic_name()
+    text = audio_quality.describe(check, hifi=True)
+    log(f"hi-fi полоса ({mic}): провал ВЧ {check.drop_db:.0f} дБ — {text}")
+    if window is not None:
+        try:
+            window.notify_hifi_band(check.narrowband, mic, text)
+        except Exception as exc:  # окно не должно ронять поток стопа записи
+            log(f"полосу hi-fi не показал: {exc!r}")
 
 
 def toggle_recording(via_ui: bool = False, to_note: bool = False) -> None:
@@ -1601,6 +1766,17 @@ def toggle_recording(via_ui: bool = False, to_note: bool = False) -> None:
         if busy:
             return
         if not recording:
+            # T-405: отказ ДО записи, а не после. Раньше пустой кэш моделей
+            # обнаруживался в конце — когда человек уже наговорил.
+            reason = no_model_reason()
+            if reason:
+                report_error(
+                    "Модель не скачана",
+                    reason,
+                    "Открой раздел «Модели» (кнопка с чипом в шапке окна) и нажми "
+                    "«Скачать» — там видно прогресс и понятно, чем закончилось.",
+                )
+                return
             via_ui_request = via_ui or to_note
             note_dictation = to_note
             captured_hwnd = 0
@@ -2141,6 +2317,9 @@ class _ModelSwitchBridge(QObject):
 
 _model_switch_bridge: "_ModelSwitchBridge | None" = None
 _model_switch_dialog = None
+# Сигнал «пользователь нажал Отмена» через то же поле, что и текст ошибки:
+# заводить второй Signal ради одного состояния — больше кода, чем смысла.
+_CANCEL_MARK = "\x00cancelled"
 
 
 def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
@@ -2156,39 +2335,72 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
     need_download = not engine.is_cached(spec)
     label = engine.spec_display(spec)
     head = f"Скачиваю модель {label}…" if need_download else f"Загружаю модель {label}…"
-    dlg = QProgressDialog(head, None, 0, 0, window)
+    # T-405: скачивание можно прервать. Кнопка есть только когда качаем: прогрев
+    # уже скачанной модели в VRAM длится секунды и прерывать там нечего.
+    dlg = QProgressDialog(head, "Отменить" if need_download else None, 0, 0, window)
     dlg.setWindowTitle("SayType — модель")
     dlg.setWindowModality(_Qt.ApplicationModal)
-    dlg.setCancelButton(None)
+    if not need_download:
+        dlg.setCancelButton(None)
     dlg.setMinimumDuration(0)
     dlg.setAutoClose(False)
     dlg.setAutoReset(False)
-    dlg.setMinimumWidth(420)
+    dlg.setMinimumWidth(460)
 
     bridge = _ModelSwitchBridge()
+    cancel_flag = {"on": False}
+    tracker = engine.DownloadProgress()
+    # Таймер тикает независимо от байтов: застой видно только так (см. T-405).
+    tick = QTimer(dlg)
+    tick.setInterval(1000)
+
+    def _cancel() -> None:
+        if cancel_flag["on"]:
+            return
+        cancel_flag["on"] = True
+        log("скачивание модели отменено пользователем")
+        if _model_switch_dialog is not None:
+            _model_switch_dialog.setLabelText(f"Останавливаю загрузку {label}…")
+
+    def _tick() -> None:
+        if _model_switch_dialog is None or cancel_flag["on"] or not need_download:
+            return
+        _model_switch_dialog.setLabelText(f"Скачиваю модель {label}…\n{tracker.text()}")
+
+    dlg.canceled.connect(_cancel)
+    tick.timeout.connect(_tick)
+    tick.start()
 
     @Slot(int, int)
     def _on_progress(done: int, total: int) -> None:
         if _model_switch_dialog is None:
             return
+        tracker.feed(done, total)
         if total > 0:
             _model_switch_dialog.setRange(0, 100)
             _model_switch_dialog.setValue(int(done * 100 / total))
-            _model_switch_dialog.setLabelText(
-                f"Скачиваю модель {label}… {done / 1e6:.0f} / {total / 1e6:.0f} МБ"
-            )
-        else:
-            _model_switch_dialog.setLabelText(
-                f"Скачиваю модель {label}… {done / 1e6:.0f} МБ"
-            )
+        if not cancel_flag["on"]:
+            _model_switch_dialog.setLabelText(f"Скачиваю модель {label}…\n{tracker.text()}")
 
     @Slot(str, str)
     def _on_finished(done_spec: str, error: str) -> None:
         global _model_switch_dialog, _model_switch_bridge
+        tick.stop()
         if _model_switch_dialog is not None:
             _model_switch_dialog.close()
             _model_switch_dialog = None
         _model_switch_bridge = None
+        if error == _CANCEL_MARK:
+            # Отмена — не сбой: окна «не удалось» быть не должно, но и молчать
+            # нельзя, иначе непонятно, осталось ли что-то на диске.
+            done_mb = tracker.done / 1e6
+            QMessageBox.information(
+                window, "Скачивание отменено",
+                f"Загрузка модели {label} остановлена."
+                + (f"\n\nСкачано {done_mb:.0f} МБ — они остались на диске, "
+                   "повторный запуск продолжит с этого места." if done_mb >= 1 else ""),
+            )
+            return
         if not error:
             log(f"model switched: {done_spec} ({MODEL_DEVICE}/{MODEL_COMPUTE_TYPE})")
             return
@@ -2229,8 +2441,14 @@ def start_model_switch(spec: str, prev_settings: "dict | None" = None) -> None:
 
     def _worker() -> None:
         try:
-            switch_model(spec, progress_cb=lambda d, t: bridge.progress.emit(int(d), int(t)))
+            switch_model(
+                spec,
+                progress_cb=lambda d, t: bridge.progress.emit(int(d), int(t)),
+                should_cancel=lambda: cancel_flag["on"],
+            )
             bridge.finished.emit(spec, "")
+        except engine.DownloadCancelled:
+            bridge.finished.emit(spec, _CANCEL_MARK)
         except Exception as exc:
             # T-404: у ошибок скачивания есть человеческий текст с причиной и
             # следующим шагом — показываем его, а не `ClassName: repr`.
@@ -2553,6 +2771,21 @@ class _Bridge(QObject):
                 pre_roll.start()
             else:
                 pre_roll.stop()
+        # T-418: pre-roll держит постоянный поток на прежнем устройстве. Без
+        # перезапуска буфера первые 500 мс каждой надиктовки продолжали бы
+        # приезжать со старого микрофона — как раз с того, от которого ушли.
+        if (new.get("mic_device", "") or "") != (prev_settings.get("mic_device", "") or ""):
+            log(f"микрофон: {prev_settings.get('mic_device') or 'системный'} → "
+                f"{new.get('mic_device') or 'системный'}")
+            if pre_roll is not None and pre_roll.is_running():
+                pre_roll.stop()
+                pre_roll.start()
+            # Прошлое предупреждение о полосе относилось к прежнему устройству.
+            if window is not None:
+                try:
+                    window.notify_hifi_band(False, current_mic_name(), "")
+                except Exception as exc:
+                    log(f"полосу hi-fi не сбросил: {exc!r}")
         # T-165: hot-reload processing_mode и auto_threshold_sec не требует side-эффектов —
         # значения снапшотятся в start_recording на каждом hotkey-down. Просто логируем
         # текущие, чтобы по логу было видно, что изменения сохранились.
@@ -2799,6 +3032,8 @@ def main() -> None:
         toggle_note_recording_via_ui=trigger_note_recording_via_ui,  # T-352
         model_busy_getter=model_busy,  # T-259: блокировка смены модели во время работы
         file_import_api=FILE_IMPORT_API,  # T-351: импорт готового аудиофайла
+        cancel_transcription=cancel_transcription,  # T-405: выход из ожидания
+        model_missing_getter=no_model_reason,       # T-405: полоса «модель не скачана»
     )
     APP_HWND = int(window.winId())  # hwnd для RegisterHotKey
 
