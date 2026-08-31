@@ -88,8 +88,8 @@ file's hash. For the current release:
 
 | File | SHA-256 | Report |
 |---|---|---|
-| `saytype-app-win-Setup.exe` | `9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380` | [VirusTotal](https://www.virustotal.com/gui/file/9613385a8eeff672714b180b5f77f9daa56a67507ae66349713010654c552380) |
-| `saytype-app-win-Portable.zip` | `ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e` | [VirusTotal](https://www.virustotal.com/gui/file/ec5c690454ba72a4ebb2d4b38c9cfba11223b5dc91cc698c74cf04819489661e) |
+| `saytype-app-win-Setup.exe` | `e6e226bc5254bc500e12406fc5953bf286d8ee93da016559f3af298342b7ad6a` | [VirusTotal](https://www.virustotal.com/gui/file/e6e226bc5254bc500e12406fc5953bf286d8ee93da016559f3af298342b7ad6a) |
+| `saytype-app-win-Portable.zip` | `7d899ffdda794eaafad8a2af9b28173162a98ea64d6938365f14cd6997bb6218` | [VirusTotal](https://www.virustotal.com/gui/file/7d899ffdda794eaafad8a2af9b28173162a98ea64d6938365f14cd6997bb6218) |
 
 Check the hash of what you downloaded before trusting the report — that is what
 ties the two together:
