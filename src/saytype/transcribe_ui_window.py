@@ -77,6 +77,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -2451,10 +2452,16 @@ class SettingsDialog(QDialog):
 
     # T-262: итог фоновой проверки обновлений приходит из рабочего потока
     update_checked = Signal(object, str)  # UpdateInfo | None, текст ошибки ("" — успех)
+    # T-443: скачивание обновления тоже идёт в фоновом потоке — только процент
+    # доходит сюда, применение и перезапуск он делает сам и не возвращается.
+    update_progress = Signal(int)
+    update_download_failed = Signal(str)
 
     def __init__(self, parent: QMainWindow | None, current: dict, model_locked: bool = False) -> None:
         super().__init__(parent)
         self.update_checked.connect(self._on_update_checked)
+        self.update_progress.connect(self._on_update_progress)
+        self.update_download_failed.connect(self._on_update_download_failed)
         self._model_locked = bool(model_locked)  # T-259: идёт запись/транскрипция
         # T-261: прежний отказ от CUDA-слоя и запрос скачивания из этого диалога
         self._cuda_declined = bool(current.get("cuda_layer_declined", False))
@@ -3416,14 +3423,54 @@ class SettingsDialog(QDialog):
         )
         if answer != QMessageBox.Yes:
             return
-        self.update_hint.setText("Скачиваю обновление…")
         self.update_btn.setEnabled(False)
-        # Управление из download_and_apply не возвращается: velopack
-        # перезапускает процесс сам, поэтому это последнее, что делает диалог.
-        threading.Thread(
-            target=lambda: updater.download_and_apply(info),
-            daemon=True, name="update-apply",
-        ).start()
+        # T-443: раньше здесь просто менялась строка в скрытом от глаз
+        # update_hint, и на 10-15 секунд скачивания человек не видел вообще
+        # ничего — не понимал, сработало нажатие или нет. Теперь модальная
+        # шкала держит фокус, пока идёт закачка; при успехе её закрывает сам
+        # перезапуск процесса, отдельно прятать не нужно.
+        self._update_progress_dialog = QProgressDialog(
+            "Скачиваю обновление…", None, 0, 100, self,
+        )
+        self._update_progress_dialog.setWindowTitle("Обновление SayType")
+        self._update_progress_dialog.setWindowModality(Qt.WindowModal)
+        self._update_progress_dialog.setMinimumDuration(0)
+        self._update_progress_dialog.setValue(0)
+        self._update_progress_dialog.show()
+
+        def _run() -> None:
+            # Управление из download_and_apply не возвращается при успехе:
+            # velopack перезапускает процесс сам. Ошибка — единственный путь,
+            # которым эта функция возвращается, поэтому только он и ловится.
+            try:
+                updater.download_and_apply(
+                    info,
+                    progress_cb=lambda pct: self.update_progress.emit(int(pct)),
+                )
+            except Exception as exc:
+                self.update_download_failed.emit(str(exc))
+
+        threading.Thread(target=_run, daemon=True, name="update-apply").start()
+
+    @Slot(int)
+    def _on_update_progress(self, percent: int) -> None:
+        dlg = getattr(self, "_update_progress_dialog", None)
+        if dlg is not None:
+            dlg.setValue(max(0, min(100, percent)))
+
+    @Slot(str)
+    def _on_update_download_failed(self, error: str) -> None:
+        dlg = getattr(self, "_update_progress_dialog", None)
+        if dlg is not None:
+            dlg.close()
+            self._update_progress_dialog = None
+        self.update_btn.setEnabled(updater.is_available())
+        self.update_hint.setText(f"Обновление не установилось: {error}")
+        QMessageBox.warning(
+            self, "Обновление не установилось",
+            f"Не получилось скачать или применить обновление:\n{error}\n\n"
+            "Попробуйте ещё раз позже.",
+        )
 
     def _on_run_wizard(self) -> None:
         """Пройти мастер заново. Настройки закрываем: мастер пишет те же ключи,
