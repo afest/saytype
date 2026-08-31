@@ -2702,22 +2702,30 @@ def _start_update_download(info) -> None:
 
     if _update_progress_dialog is not None:
         return
-    dlg = QProgressDialog("Скачиваю обновление…", None, 0, 100, window)
+    # T-443: до первого вызова progress_cb velopack сам резолвит путь
+    # обновления (полный пакет или delta, какой из них) — замерено до 70 сек
+    # молчания на реальном апдейте, обратного вызова на этом этапе нет.
+    # Неопределённая полоса (setRange(0, 0)) — единственный честный способ
+    # сказать «идёт процесс», не обещая процент, которого ещё нет.
+    dlg = QProgressDialog("Готовлюсь к обновлению…", None, 0, 0, window)
     dlg.setWindowTitle("Обновление SayType")
     dlg.setWindowModality(_Qt.ApplicationModal)
     dlg.setMinimumDuration(0)
     dlg.setAutoClose(False)
     dlg.setAutoReset(False)
     dlg.setMinimumWidth(420)
-    dlg.setValue(0)
     _update_progress_dialog = dlg
 
     bridge = _update_bridge or _UpdateBridge()
 
     @Slot(int)
     def _on_progress(percent: int) -> None:
-        if _update_progress_dialog is not None:
-            _update_progress_dialog.setValue(max(0, min(100, percent)))
+        if _update_progress_dialog is None:
+            return
+        if _update_progress_dialog.maximum() == 0:
+            _update_progress_dialog.setLabelText("Скачиваю обновление…")
+            _update_progress_dialog.setRange(0, 100)
+        _update_progress_dialog.setValue(max(0, min(100, percent)))
 
     @Slot(str)
     def _on_failed(error: str) -> None:

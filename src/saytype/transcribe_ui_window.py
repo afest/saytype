@@ -3440,13 +3440,15 @@ class SettingsDialog(QDialog):
         # ничего — не понимал, сработало нажатие или нет. Теперь модальная
         # шкала держит фокус, пока идёт закачка; при успехе её закрывает сам
         # перезапуск процесса, отдельно прятать не нужно.
+        # T-443: до первого вызова progress_cb velopack сам резолвит путь
+        # обновления — замерено до 70 сек молчания на реальном апдейте.
+        # Неопределённая полоса, пока не пойдут реальные проценты.
         self._update_progress_dialog = QProgressDialog(
-            "Скачиваю обновление…", None, 0, 100, self,
+            "Готовлюсь к обновлению…", None, 0, 0, self,
         )
         self._update_progress_dialog.setWindowTitle("Обновление SayType")
         self._update_progress_dialog.setWindowModality(Qt.WindowModal)
         self._update_progress_dialog.setMinimumDuration(0)
-        self._update_progress_dialog.setValue(0)
         self._update_progress_dialog.show()
         # На быстром апдейте скачивание могло завершиться и убить процесс
         # раньше, чем Qt успевал отрисовать первый кадр — .show() только
@@ -3470,8 +3472,12 @@ class SettingsDialog(QDialog):
     @Slot(int)
     def _on_update_progress(self, percent: int) -> None:
         dlg = getattr(self, "_update_progress_dialog", None)
-        if dlg is not None:
-            dlg.setValue(max(0, min(100, percent)))
+        if dlg is None:
+            return
+        if dlg.maximum() == 0:
+            dlg.setLabelText("Скачиваю обновление…")
+            dlg.setRange(0, 100)
+        dlg.setValue(max(0, min(100, percent)))
 
     @Slot(str)
     def _on_update_download_failed(self, error: str) -> None:
