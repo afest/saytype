@@ -2646,6 +2646,7 @@ def _show_update_offer(info) -> None:
     сделать апдейтер. Окно висит, работать не мешает, закрывается без ответа.
     """
     global _update_box
+    from PySide6.QtCore import Qt as _Qt
     from PySide6.QtWidgets import QMessageBox
 
     if _update_box is not None:
@@ -2653,13 +2654,21 @@ def _show_update_offer(info) -> None:
     version = updater.version_of(info)
     # T-328: «что изменилось» перед кнопкой «Обновить». Заметок нет (старый
     # релиз, фид без них) — окно остаётся ровно таким, каким было до T-328.
+    #
+    # T-443: NotesMarkdown из живого UpdateInfo (не из тестовых данных — там
+    # всё разбирается верно) на реальном апдейте приходил пустым в трёх
+    # прогонах подряд, причину поймать не удалось. Полный список изменений
+    # ссылкой на страницу релиза — не зависит от того, почему это поле пустое.
     notes = updater.notes_of(info)
     box = QMessageBox(window)
     box.setWindowTitle("Доступно обновление")
     box.setIcon(QMessageBox.Information)
     box.setText(f"Вышла версия {version}.")
+    box.setTextFormat(_Qt.RichText)
+    release_url = updater.release_page_url(info)
     box.setInformativeText(
         (notes + "\n\n" if notes else "")
+        + f'Что изменилось: <a href="{release_url}">страница релиза</a>.\n\n'
         + "Записи, настройки, словарь и скачанные модели останутся на месте."
     )
     update_btn = box.addButton("Обновить и перезапустить", QMessageBox.AcceptRole)

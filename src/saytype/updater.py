@@ -45,21 +45,6 @@ ENV_FEED = "SAYTYPE_UPDATE_FEED"
 
 _check_lock = threading.Lock()
 
-# T-443: временная диагностика бага "пустые заметки релиза в диалоге
-# обновления" — log() уходит в никуда в console=False сборке, писать
-# приходится в файл, который потом можно прочитать с диска напрямую.
-# Снять после того, как причина будет найдена и починена.
-def _debug_dump(msg: str) -> None:
-    try:
-        from . import profile
-        path = profile.profile_dir() / "runtime" / "_update_notes_debug.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        import datetime as _dt
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{_dt.datetime.now().isoformat()}] {msg}\n\n")
-    except Exception:
-        pass
-
 
 def log(msg: str) -> None:
     line = f"[updater] {msg}"
@@ -159,6 +144,17 @@ def version_of(info) -> str:
         return "?"
 
 
+def release_page_url(info) -> str:
+    """Страница релиза на GitHub — что человек увидит в браузере по клику.
+
+    Не завязано на GITHUB_REPO как источник фида: T-354 может сменить его на
+    статический хост или локальную папку для тестов, но страница релиза с
+    заметками всё равно живёт на GitHub — адрес собирается напрямую.
+    """
+    version = version_of(info)
+    return f"https://github.com/afest/saytype/releases/tag/v{version}"
+
+
 def notes_of(info, max_lines: int = 8, max_chars: int = 700) -> str:
     """Заметки релиза обычным текстом. Нечего показать — пустая строка.
 
@@ -169,10 +165,8 @@ def notes_of(info, max_lines: int = 8, max_chars: int = 700) -> str:
     """
     try:
         raw = str(getattr(info.TargetFullRelease, "NotesMarkdown", "") or "")
-    except Exception as exc:
-        _debug_dump(f"NotesMarkdown read failed: {exc!r}")
+    except Exception:
         return ""
-    _debug_dump(f"raw NotesMarkdown length: {len(raw)}\n---\n{raw[:500]!r}")
     # Комментарии markdown — служебные пометки для того, кто ведёт CHANGELOG.md;
     # человеку в окне обновления они не адресованы. Поймано живым прогоном:
     # маркер из файла доехал до диалога и встал отдельным пунктом.

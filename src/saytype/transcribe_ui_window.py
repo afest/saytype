@@ -3412,16 +3412,27 @@ class SettingsDialog(QDialog):
             return
         version = updater.version_of(info)
         self.update_hint.setText(f"Доступна версия {version}.")
-        notes = updater.notes_of(info)  # T-328: пусто — текст как до T-328
-        answer = QMessageBox.question(
-            self, "Доступно обновление",
+        # T-328: пусто — текст как до T-328. T-443: NotesMarkdown на живом
+        # апдейте приходил пустым в трёх прогонах подряд, причину поймать не
+        # удалось — ссылка на страницу релиза не зависит от того, почему.
+        notes = updater.notes_of(info)
+        release_url = updater.release_page_url(info)
+        box = QMessageBox(self)
+        box.setWindowTitle("Доступно обновление")
+        box.setIcon(QMessageBox.Question)
+        box.setTextFormat(Qt.RichText)
+        box.setText(
             f"Версия {version} готова к установке.\n\n"
             + (notes + "\n\n" if notes else "")
+            + f'Что изменилось: <a href="{release_url}">страница релиза</a>.\n\n'
             + "Скачать и перезапустить приложение? Записи, настройки и скачанные "
-            "модели останутся на месте.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            "модели останутся на месте."
         )
-        if answer != QMessageBox.Yes:
+        yes_btn = box.addButton(QMessageBox.Yes)
+        box.addButton(QMessageBox.No)
+        box.setDefaultButton(yes_btn)
+        box.exec()
+        if box.clickedButton() is not yes_btn:
             return
         self.update_btn.setEnabled(False)
         # T-443: раньше здесь просто менялась строка в скрытом от глаз
