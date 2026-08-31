@@ -1197,18 +1197,35 @@ def hotkey_conflicts_with_handy(hotkey: str) -> bool:
 
 # === О программе ===
 
-# Страница «Поддержать разработку» живёт ВНЕ приложения: за одним стабильным
-# URL меняется набор платёжных способов, и смена сервиса не требует нового
-# билда и релиза (T-354, разбор — docs/донат-сервисы.md в карточке проекта).
+# Единственный рабочий способ на сегодня — перевод по номеру телефона (СБП),
+# без комиссии, из любого банка отправителя. CloudTips и DonationAlerts из
+# T-354 (разбор — docs/донат-сервисы.md) не подключены; когда подключатся,
+# сюда добавится ссылка вместо обычного текстового номера. Диалог, а не
+# страница в браузере: SayType — десктопное приложение, а перевод человек
+# делает в банковском приложении на телефоне — открывать браузер ради одного
+# номера незачем, скопировать его можно и из окна самой программы.
 # Формулировка везде «поддержать разработку», а не «купить»/«разблокировать»:
 # донат за уже бесплатную программу — дар, а обещание чего-то взамен делает
 # его выручкой.
-DONATE_URL = "https://afest.github.io/pages/p/donate/"
+DONATE_PHONE = "+7 950 541 92 21"
+DONATE_PHONE_RAW = "+79505419221"
 
 
-def open_donate_page() -> None:
-    """Открыть страницу поддержки в браузере (из «О программе» и из трея)."""
-    QDesktopServices.openUrl(QUrl(DONATE_URL))
+def open_donate_page(parent: "QWidget | None" = None) -> None:
+    """Показать номер для доната по СБП (из «О программе» и из трея)."""
+    box = QMessageBox(parent)
+    box.setWindowTitle("Поддержать разработку")
+    box.setIcon(QMessageBox.NoIcon)
+    box.setText(
+        "SayType бесплатен и таким останется. Донат ничего не открывает и "
+        "ни к чему не обязывает — просто способ сказать спасибо.\n\n"
+        f"Перевод по номеру телефона (СБП, без комиссии):\n{DONATE_PHONE}"
+    )
+    copy_btn = box.addButton("Скопировать номер", QMessageBox.ActionRole)
+    box.addButton("Закрыть", QMessageBox.RejectRole)
+    box.exec()
+    if box.clickedButton() is copy_btn:
+        QApplication.clipboard().setText(DONATE_PHONE_RAW)
 
 
 # Компоненты под LGPL-3.0, которые едут в поставке. Ссылка ведёт на исходники
@@ -1304,7 +1321,7 @@ class AboutDialog(QDialog):
 
         buttons = QDialogButtonBox()
         donate_btn = buttons.addButton("Поддержать разработку", QDialogButtonBox.ActionRole)
-        donate_btn.setToolTip(DONATE_URL)
+        donate_btn.setToolTip(DONATE_PHONE)
         donate_btn.clicked.connect(self._open_donate)
         licenses_btn = buttons.addButton("Тексты лицензий", QDialogButtonBox.ActionRole)
         licenses_btn.clicked.connect(self._open_licenses)
@@ -1322,7 +1339,7 @@ class AboutDialog(QDialog):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _open_donate(self) -> None:
-        open_donate_page()
+        open_donate_page(self)
 
 
 class _EqualizerBars(QWidget):
@@ -6087,7 +6104,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.notes_btn)
 
         # T-354: «Поддержать разработку» — после рабочих инструментов, перед
-        # настройками. Ведёт на страницу вне приложения (см. DONATE_URL).
+        # настройками. Показывает номер для перевода (см. open_donate_page).
         self._ico_heart = _mk_icon(_draw_heart, 18, "#52525B")
         self.donate_btn = QPushButton()
         self.donate_btn.setObjectName("btn_settings")
@@ -6548,7 +6565,7 @@ class MainWindow(QMainWindow):
         AboutDialog(self).exec()
 
     def open_donate(self) -> None:
-        open_donate_page()
+        open_donate_page(self)
 
     def open_settings(self) -> None:
         current = load_settings_dict()
