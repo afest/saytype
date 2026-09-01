@@ -149,3 +149,43 @@ def test_notes_are_capped():
     body, tail = notes.rsplit("\n", 1)
     assert len(body.splitlines()) == 8
     assert "и ещё изменения" in tail
+
+
+# === T-443: размер загрузки ===
+
+
+class _SizeInfo:
+    """UpdateInfo в объёме, который читает download_size_mb."""
+
+    def __init__(self, full_size, delta_sizes=None):
+        self.TargetFullRelease = type("Asset", (), {"Size": full_size})()
+        self.DeltasToTarget = [
+            type("Delta", (), {"Size": s})() for s in (delta_sizes or [])
+        ]
+
+
+def test_download_size_uses_full_package_when_no_delta():
+    """Базовой версии нет в фиде — velopack тянет полный пакет, так и говорим.
+
+    Ровно этот случай на живом обновлении 0.2.0 → 0.3.0: 0.2.0 в фиде нет,
+    delta не применима, и по сети едут 175 МБ вместо 36. Человеку показывается
+    именно та цифра, которая объясняет, почему обновление идёт минуту, а не
+    пять секунд.
+    """
+    assert updater.download_size_mb(_SizeInfo(175272007)) == 167
+
+
+def test_download_size_prefers_deltas_when_they_apply():
+    assert updater.download_size_mb(_SizeInfo(175272007, [36041079])) == 34
+
+
+def test_download_size_sums_delta_chain():
+    """Через несколько версий velopack применяет цепочку delta — считаем все."""
+    assert updater.download_size_mb(_SizeInfo(175272007, [1048576, 2097152])) == 3
+
+
+def test_download_size_unknown_is_none_not_zero():
+    """Размер не выяснился — окно не должно обещать «~0 МБ»."""
+    assert updater.download_size_mb(object()) is None
+    assert updater.download_size_mb(_SizeInfo(0)) is None
+    assert updater.download_size_mb(_SizeInfo(None)) is None

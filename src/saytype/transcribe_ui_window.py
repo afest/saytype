@@ -1917,6 +1917,44 @@ class _SpinnerLabel(QLabel):
         self.setPixmap(pix)
 
 
+class BusyButton(QPushButton):
+    """Кнопка, которая после нажатия крутит индикатор вместо того, чтобы гаснуть.
+
+    T-443: между нажатием «Обновить и перезапустить» и первым процентом от
+    velopack проходит до 70 секунд — он всё это время сам решает, какой пакет
+    тянуть, и качает его, обратных вызовов оттуда нет. Погасшая кнопка и
+    неподвижное окно в этот момент читаются как «нажатие не сработало», и
+    человек жмёт второй раз. Крутящийся индикатор — единственное, что честно
+    говорит «идёт», не обещая процента, которого ещё нет.
+
+    Рисует тот же `_SpinnerLabel`, что и индикатор обработки в главном окне.
+    """
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self._spinner = _SpinnerLabel(self, color="#FFFFFF", size=14)
+        self._spinner.hide()
+
+    def start_busy(self, text: str) -> None:
+        """Заблокировать кнопку, сменить надпись и запустить индикатор."""
+        self.setEnabled(False)
+        self.setText("     " + text)  # место под индикатор слева от текста
+        self._spinner.show()
+        self._spinner.start()
+        self._place_spinner()
+
+    def stop_busy(self) -> None:
+        self._spinner.stop()
+        self._spinner.hide()
+
+    def _place_spinner(self) -> None:
+        self._spinner.move(12, (self.height() - self._spinner.height()) // 2)
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        self._place_spinner()
+
+
 class _PulseDot(QLabel):
     """Пульсирующая красная точка (0.7s on/off cycle)."""
 
@@ -3417,68 +3455,100 @@ class SettingsDialog(QDialog):
         # удалось — ссылка на страницу релиза не зависит от того, почему.
         notes = updater.notes_of(info)
         release_url = updater.release_page_url(info)
-        box = QMessageBox(self)
-        box.setWindowTitle("Доступно обновление")
-        box.setIcon(QMessageBox.Question)
-        box.setTextFormat(Qt.RichText)
-        box.setText(
-            f"Версия {version} готова к установке.\n\n"
-            + (notes + "\n\n" if notes else "")
-            + f'Что изменилось: <a href="{release_url}">страница релиза</a>.\n\n'
+        # T-443: не QMessageBox с exec() — он закрывается в момент нажатия, а
+        # дальше идут до 70 секунд, в которые velopack ничего не сообщает. Своё
+        # окно остаётся на экране и крутит индикатор на кнопке всё это время;
+        # закроется, когда появится настоящий прогресс-бар.
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Доступно обновление")
+
+        text = QLabel(dlg)
+        text.setTextFormat(Qt.RichText)
+        text.setOpenExternalLinks(True)
+        text.setWordWrap(True)
+        text.setText(
+            f"<b>Версия {version} готова к установке.</b><br><br>"
+            + ((notes.replace("\n", "<br>") + "<br><br>") if notes else "")
+            + f'Что изменилось: <a href="{release_url}">страница релиза</a>.<br><br>'
             + "Скачать и перезапустить приложение? Записи, настройки и скачанные "
             "модели останутся на месте."
         )
-        yes_btn = box.addButton(QMessageBox.Yes)
-        box.addButton(QMessageBox.No)
-        box.setDefaultButton(yes_btn)
-        box.exec()
-        if box.clickedButton() is not yes_btn:
-            return
-        self.update_btn.setEnabled(False)
-        # T-443: раньше здесь просто менялась строка в скрытом от глаз
-        # update_hint, и на 10-15 секунд скачивания человек не видел вообще
-        # ничего — не понимал, сработало нажатие или нет. Теперь модальная
-        # шкала держит фокус, пока идёт закачка; при успехе её закрывает сам
-        # перезапуск процесса, отдельно прятать не нужно.
-        # T-443: до первого вызова progress_cb velopack сам резолвит путь
-        # обновления — замерено до 70 сек молчания на реальном апдейте.
-        # Неопределённая полоса, пока не пойдут реальные проценты.
-        # cancelButtonText принимает пустую строку как «нет кнопки», а не
-        # None — PySide6 здесь требует str (проверено живым TypeError).
-        self._update_progress_dialog = QProgressDialog(
-            "Готовлюсь к обновлению…", "", 0, 0, self,
-        )
-        self._update_progress_dialog.setWindowTitle("Обновление SayType")
-        self._update_progress_dialog.setWindowModality(Qt.WindowModal)
-        self._update_progress_dialog.setMinimumDuration(0)
-        self._update_progress_dialog.show()
-        # На быстром апдейте скачивание могло завершиться и убить процесс
-        # раньше, чем Qt успевал отрисовать первый кадр — .show() только
-        # планирует показ. Форсируем прорисовку синхронно.
-        QApplication.processEvents()
+        text.setMinimumWidth(420)
 
-        def _run() -> None:
-            # Управление из download_and_apply не возвращается при успехе:
-            # velopack перезапускает процесс сам. Ошибка — единственный путь,
-            # которым эта функция возвращается, поэтому только он и ловится.
-            try:
-                updater.download_and_apply(
-                    info,
-                    progress_cb=lambda pct: self.update_progress.emit(int(pct)),
-                )
-            except Exception as exc:
-                self.update_download_failed.emit(str(exc))
+        yes_btn = BusyButton("Скачать и перезапустить", dlg)
+        yes_btn.setDefault(True)
+        no_btn = QPushButton("Не сейчас", dlg)
 
-        threading.Thread(target=_run, daemon=True, name="update-apply").start()
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(yes_btn)
+        buttons.addWidget(no_btn)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(text)
+        layout.addSpacing(8)
+        layout.addLayout(buttons)
+
+        def _start_download() -> None:
+            size_mb = updater.download_size_mb(info)
+            yes_btn.start_busy(
+                f"Готовлюсь к обновлению… ~{size_mb} МБ"
+                if size_mb
+                else "Готовлюсь к обновлению…"
+            )
+            no_btn.setEnabled(False)
+            self.update_btn.setEnabled(False)
+            # Окно предложения остаётся на экране — его закроет
+            # _on_update_progress, когда появится настоящий прогресс-бар.
+            self._update_offer_dialog = dlg
+
+            def _run() -> None:
+                # Управление из download_and_apply не возвращается при успехе:
+                # velopack перезапускает процесс сам. Ошибка — единственный путь,
+                # которым эта функция возвращается, поэтому только он и ловится.
+                try:
+                    updater.download_and_apply(
+                        info,
+                        progress_cb=lambda pct: self.update_progress.emit(int(pct)),
+                    )
+                except Exception as exc:
+                    self.update_download_failed.emit(str(exc))
+
+            threading.Thread(target=_run, daemon=True, name="update-apply").start()
+
+        yes_btn.clicked.connect(_start_download)
+        no_btn.clicked.connect(dlg.reject)
+        # show(), не exec(): модальный цикл вернул бы управление только после
+        # закрытия окна, а окно должно жить всю закачку.
+        dlg.show()
+
+    def _close_update_offer(self) -> None:
+        """Убрать окно предложения — зовётся, когда его сменяет прогресс-бар."""
+        offer = getattr(self, "_update_offer_dialog", None)
+        if offer is not None:
+            offer.close()
+            self._update_offer_dialog = None
 
     @Slot(int)
     def _on_update_progress(self, percent: int) -> None:
         dlg = getattr(self, "_update_progress_dialog", None)
         if dlg is None:
-            return
-        if dlg.maximum() == 0:
-            dlg.setLabelText("Скачиваю обновление…")
-            dlg.setRange(0, 100)
+            # Первый реальный процент — только теперь есть что показывать шкалой.
+            # До этого момента «идёт» говорил индикатор на кнопке в окне
+            # предложения; создать шкалу раньше значило бы показать пустую
+            # полосу на 70 секунд.
+            dlg = QProgressDialog("Скачиваю обновление…", "", 0, 100, self)
+            dlg.setWindowTitle("Обновление SayType")
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            self._update_progress_dialog = dlg
+            dlg.show()
+            # .show() только планирует показ; на быстром апдейте процесс мог бы
+            # перезапуститься раньше первой отрисовки. Форсируем кадр.
+            QApplication.processEvents()
+            self._close_update_offer()
         dlg.setValue(max(0, min(100, percent)))
 
     @Slot(str)
@@ -3487,6 +3557,9 @@ class SettingsDialog(QDialog):
         if dlg is not None:
             dlg.close()
             self._update_progress_dialog = None
+        # Сбой мог случиться и до первого процента — тогда на экране всё ещё
+        # висит окно предложения с крутящейся кнопкой, и убрать его некому.
+        self._close_update_offer()
         self.update_btn.setEnabled(updater.is_available())
         self.update_hint.setText(f"Обновление не установилось: {error}")
         QMessageBox.warning(

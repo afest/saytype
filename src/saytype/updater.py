@@ -209,6 +209,33 @@ def notes_of(info, max_lines: int = 8, max_chars: int = 700) -> str:
     return result
 
 
+def download_size_mb(info) -> "int | None":
+    """Сколько мегабайт реально поедет по сети. Не смогли понять — None.
+
+    T-443: velopack сам решает, хватит ли delta-пакета или нужен полный, и до
+    первого процента это решение занимает до 70 секунд. Человеку в это время
+    показывается «идёт», и размер — единственное, что объясняет, почему идёт
+    так долго: разница между 36 и 175 МБ ощущается как разница между «сейчас»
+    и «сходи за чаем».
+
+    Delta применима не всегда: если установленной версии нет в фиде (так вышло
+    с 0.2.0 — её там просто нет), velopack тянет полный пакет. Поэтому считаем
+    по тому, что он сам положил в DeltasToTarget, а не по наличию delta-файла
+    в релизе.
+    """
+    try:
+        deltas = list(getattr(info, "DeltasToTarget", None) or [])
+        if deltas:
+            total = sum(int(getattr(d, "Size", 0) or 0) for d in deltas)
+        else:
+            total = int(getattr(info.TargetFullRelease, "Size", 0) or 0)
+    except Exception:
+        return None
+    if total <= 0:
+        return None
+    return max(1, round(total / (1024 * 1024)))
+
+
 def download_and_apply(
     info,
     progress_cb: Optional[Callable[[int], None]] = None,

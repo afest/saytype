@@ -189,6 +189,7 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Signal, 
 from PySide6.QtWidgets import QApplication
 
 from .transcribe_ui_window import (
+    BusyButton,
     MainWindow,
     create_autostart_shortcut,
     autostart_shortcut_exists,
@@ -2647,7 +2648,13 @@ def _show_update_offer(info) -> None:
     """
     global _update_box
     from PySide6.QtCore import Qt as _Qt
-    from PySide6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import (
+        QDialog,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QVBoxLayout,
+    )
 
     if _update_box is not None:
         return
@@ -2660,41 +2667,81 @@ def _show_update_offer(info) -> None:
     # прогонах подряд, причину поймать не удалось. Полный список изменений
     # ссылкой на страницу релиза — не зависит от того, почему это поле пустое.
     notes = updater.notes_of(info)
-    box = QMessageBox(window)
-    box.setWindowTitle("Доступно обновление")
-    box.setIcon(QMessageBox.Information)
-    box.setText(f"Вышла версия {version}.")
-    box.setTextFormat(_Qt.RichText)
     release_url = updater.release_page_url(info)
-    box.setInformativeText(
-        (notes + "\n\n" if notes else "")
-        + f'Что изменилось: <a href="{release_url}">страница релиза</a>.\n\n'
+
+    # T-443: не QMessageBox — он закрывается сам, как только отработал обработчик
+    # кнопки, а нам нужно ровно обратное: окно остаётся на экране и крутит
+    # индикатор все ~70 секунд, пока velopack молчит. Своё окно из QDialog —
+    # единственный способ управлять моментом закрытия.
+    dlg = QDialog(window)
+    dlg.setWindowTitle("Доступно обновление")
+    dlg.setModal(False)
+
+    text = QLabel(dlg)
+    text.setTextFormat(_Qt.RichText)
+    text.setOpenExternalLinks(True)
+    text.setWordWrap(True)
+    text.setText(
+        f"<b>Вышла версия {version}.</b><br><br>"
+        + ((notes.replace("\n", "<br>") + "<br><br>") if notes else "")
+        + f'Что изменилось: <a href="{release_url}">страница релиза</a>.<br><br>'
         + "Записи, настройки, словарь и скачанные модели останутся на месте."
     )
-    update_btn = box.addButton("Обновить и перезапустить", QMessageBox.AcceptRole)
-    box.addButton("Позже", QMessageBox.RejectRole)
-    box.setDefaultButton(update_btn)
+    text.setMinimumWidth(420)
 
-    def _on_done(_button) -> None:
+    update_btn = BusyButton("Обновить и перезапустить", dlg)
+    update_btn.setDefault(True)
+    later_btn = QPushButton("Позже", dlg)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    buttons.addWidget(update_btn)
+    buttons.addWidget(later_btn)
+
+    layout = QVBoxLayout(dlg)
+    layout.addWidget(text)
+    layout.addSpacing(8)
+    layout.addLayout(buttons)
+
+    def _on_later() -> None:
         global _update_box
         _update_box = None
-        if box.clickedButton() is not update_btn:
-            log("обновление отложено пользователем")
-            return
-        _start_update_download(info)
+        log("обновление отложено пользователем")
+        dlg.close()
 
-    box.buttonClicked.connect(_on_done)
-    _update_box = box
-    box.show()
+    def _on_update() -> None:
+        # Окно намеренно НЕ закрывается: до первого процента от velopack проходит
+        # до 70 секунд, и исчезнувшее окно без всякой замены читается как
+        # «ничего не произошло». Закроет его _start_update_download, когда
+        # покажет настоящий прогресс-бар.
+        size_mb = updater.download_size_mb(info)
+        update_btn.start_busy(
+            f"Готовлюсь к обновлению… ~{size_mb} МБ" if size_mb else "Готовлюсь к обновлению…"
+        )
+        later_btn.setEnabled(False)
+        _start_update_download(info, offer_dialog=dlg)
+
+    update_btn.clicked.connect(_on_update)
+    later_btn.clicked.connect(_on_later)
+    _update_box = dlg
+    dlg.show()
 
 
-def _start_update_download(info) -> None:
+def _start_update_download(info, offer_dialog=None) -> None:
     """Качать с видимым прогрессом — тот же приём, что у CUDA-слоя и модели.
 
     T-443: раньше здесь просто уходил фоновый поток без единого UI-хука, и
     человек 10-15 секунд не видел вообще ничего, пока velopack качал и
     распаковывал пакет — не мог понять, сработало ли нажатие. Ошибка тоже
     терялась молча: исключение в daemon-потоке без обработчика просто пропадало.
+
+    `offer_dialog` — окно «Доступно обновление», которое к этому моменту уже
+    крутит индикатор на своей кнопке. Оно остаётся на экране и закрывается
+    ровно в тот момент, когда появляется настоящий прогресс-бар: до первого
+    процента velopack молчит до 70 секунд (он резолвит путь обновления и
+    качает пакет — при отсутствии базовой версии в фиде это полные 175 МБ), и
+    закрыть окно раньше — значит вернуть ту самую пустоту, ради которой всё
+    это и делается.
     """
     global _update_progress_dialog
     from PySide6.QtCore import Qt as _Qt
@@ -2702,32 +2749,37 @@ def _start_update_download(info) -> None:
 
     if _update_progress_dialog is not None:
         return
-    # T-443: до первого вызова progress_cb velopack сам резолвит путь
-    # обновления (полный пакет или delta, какой из них) — замерено до 70 сек
-    # молчания на реальном апдейте, обратного вызова на этом этапе нет.
-    # Неопределённая полоса (setRange(0, 0)) — единственный честный способ
-    # сказать «идёт процесс», не обещая процент, которого ещё нет.
-    # cancelButtonText принимает пустую строку как «нет кнопки», а не None —
-    # PySide6 здесь требует str, а не Optional[str] (проверено живым TypeError).
-    dlg = QProgressDialog("Готовлюсь к обновлению…", "", 0, 0, window)
-    dlg.setWindowTitle("Обновление SayType")
-    dlg.setWindowModality(_Qt.ApplicationModal)
-    dlg.setMinimumDuration(0)
-    dlg.setAutoClose(False)
-    dlg.setAutoReset(False)
-    dlg.setMinimumWidth(420)
-    _update_progress_dialog = dlg
 
     bridge = _update_bridge or _UpdateBridge()
 
+    def _close_offer() -> None:
+        global _update_box
+        if offer_dialog is not None:
+            offer_dialog.close()
+        _update_box = None
+
+    def _ensure_progress_dialog() -> "QProgressDialog":
+        """Создать прогресс-бар по первому реальному проценту, не раньше."""
+        global _update_progress_dialog
+        if _update_progress_dialog is None:
+            dlg = QProgressDialog("Скачиваю обновление…", "", 0, 100, window)
+            dlg.setWindowTitle("Обновление SayType")
+            dlg.setWindowModality(_Qt.ApplicationModal)
+            dlg.setMinimumDuration(0)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.setMinimumWidth(420)
+            _update_progress_dialog = dlg
+            dlg.show()
+            # .show() только планирует показ — на быстром апдейте процесс мог
+            # умереть от перезапуска раньше первой отрисовки. Форсируем кадр.
+            QApplication.processEvents()
+            _close_offer()  # прогресс-бар на экране — окно предложения не нужно
+        return _update_progress_dialog
+
     @Slot(int)
     def _on_progress(percent: int) -> None:
-        if _update_progress_dialog is None:
-            return
-        if _update_progress_dialog.maximum() == 0:
-            _update_progress_dialog.setLabelText("Скачиваю обновление…")
-            _update_progress_dialog.setRange(0, 100)
-        _update_progress_dialog.setValue(max(0, min(100, percent)))
+        _ensure_progress_dialog().setValue(max(0, min(100, percent)))
 
     @Slot(str)
     def _on_failed(error: str) -> None:
@@ -2735,6 +2787,7 @@ def _start_update_download(info) -> None:
         if _update_progress_dialog is not None:
             _update_progress_dialog.close()
             _update_progress_dialog = None
+        _close_offer()
         QMessageBox.warning(
             window, "Обновление не установилось",
             f"Не получилось скачать или применить обновление:\n{error}\n\n"
@@ -2743,12 +2796,6 @@ def _start_update_download(info) -> None:
 
     bridge.progress.connect(_on_progress)
     bridge.failed.connect(_on_failed)
-    dlg.show()
-    # На быстром апдейте (маленький delta, хороший канал) скачивание могло
-    # завершиться и убить процесс раньше, чем Qt успевал отрисовать первый
-    # кадр диалога — .show() только планирует показ, реальная прорисовка
-    # ждёт следующего прохода event loop. Форсируем его синхронно.
-    QApplication.processEvents()
 
     def _run() -> None:
         # Управление сюда не возвращается при успехе: velopack перезапускает

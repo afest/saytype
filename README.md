@@ -96,8 +96,8 @@ Python ставить не нужно, установщик несёт свой.
 
 | Файл | SHA-256 | Отчёт |
 |---|---|---|
-| `saytype-app-win-Setup.exe` | `2dc6c382d33605dc1e62651053435763c74847467c1514a1cb9673bdacd940e1` | [VirusTotal](https://www.virustotal.com/gui/file/2dc6c382d33605dc1e62651053435763c74847467c1514a1cb9673bdacd940e1) |
-| `saytype-app-win-Portable.zip` | `e78e78c2e20bee080cb2c85efc429a2cf4ab7752c00ab9a9d356f5b8e29c7169` | [VirusTotal](https://www.virustotal.com/gui/file/e78e78c2e20bee080cb2c85efc429a2cf4ab7752c00ab9a9d356f5b8e29c7169) |
+| `saytype-app-win-Setup.exe` | `372249fe6def36a3b0122b9864768a7c5774d271f41c2c6014cd5ece67ebb9e0` | [VirusTotal](https://www.virustotal.com/gui/file/372249fe6def36a3b0122b9864768a7c5774d271f41c2c6014cd5ece67ebb9e0) |
+| `saytype-app-win-Portable.zip` | `442404571e97078bffdae80aa424e81341a8e107ca62bb8e019ce4813d999665` | [VirusTotal](https://www.virustotal.com/gui/file/442404571e97078bffdae80aa424e81341a8e107ca62bb8e019ce4813d999665) |
 
 Прежде чем доверять отчёту, сверьте хеш того, что скачали, — именно он связывает
 одно с другим:
@@ -106,7 +106,7 @@ Python ставить не нужно, установщик несёт свой.
 Get-FileHash .\saytype-app-win-Setup.exe -Algorithm SHA256
 ```
 
-Когда пара движков из семидесяти показывает общую эвристику — это обычный
+Когда несколько движков из семидесяти показывают общую эвристику — это обычный
 результат для неподписанной сборки PyInstaller. Почему так, читайте ниже.
 
 <a id="antivirus-warnings"></a>
