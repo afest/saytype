@@ -12,6 +12,6 @@ on its own for batch transcription::
     model = engine.load_model("small")
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = ["__version__"]
