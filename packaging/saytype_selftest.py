@@ -24,6 +24,7 @@ CHECKS = [
     ("pyaudiowpatch (WASAPI loopback)", "pyaudiowpatch"),
     ("saytype.hotkeys (разбор hotkey)", "saytype.hotkeys"),
     ("pyperclip (автопаст)", "pyperclip"),
+    ("shiboken6 (рантайм привязок Qt)", "shiboken6"),
     ("PySide6.QtWidgets", "PySide6.QtWidgets"),
     ("PySide6.QtMultimedia (плеер)", "PySide6.QtMultimedia"),
     ("PySide6.QtCharts (статистика)", "PySide6.QtCharts"),

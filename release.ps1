@@ -93,27 +93,51 @@ if ($patched -ne $init) {
 # если он изменился — нужен второй проход, иначе в поставке едет вчерашний
 # список. Проверять надо архив, а не список зависимостей.
 if (-not $SkipBuild) {
-    Write-Output "== PyInstaller (проход 1) =="
-    & $python -m PyInstaller --noconfirm saytype.spec
-    if ($LASTEXITCODE -ne 0) { throw "PyInstaller упал (код $LASTEXITCODE)" }
+    # Codex Desktop добавляет в PATH собственные native tools (включая Poppler).
+    # PyInstaller принимает найденные там DLL за зависимости приложения: так в
+    # 0.3.2 попала чужая ICU 78, несовместимая с Qt, и Qt6Core падал с WinError 127.
+    # Сборка не должна зависеть от оболочки, из которой запущен release.ps1.
+    $buildPath = $env:PATH
+    try {
+        $env:PATH = (($buildPath -split ';') |
+            Where-Object { $_ -and $_ -notmatch '(?i)[\\/]\.cache[\\/]codex-runtimes[\\/]' }) -join ';'
 
-    $licenseFile = "licenses\THIRD-PARTY-LICENSES.txt"
-    $before = if (Test-Path $licenseFile) { (Get-FileHash $licenseFile).Hash } else { "" }
-    Write-Output "== список сторонних лицензий по составу сборки =="
-    & $python tools\collect_licenses.py
-    if ($LASTEXITCODE -ne 0) { throw "collect_licenses упал (код $LASTEXITCODE)" }
-    $after = (Get-FileHash $licenseFile).Hash
-
-    if ($before -ne $after) {
-        Write-Output "== список изменился → PyInstaller (проход 2) =="
+        Write-Output "== PyInstaller (проход 1) =="
         & $python -m PyInstaller --noconfirm saytype.spec
         if ($LASTEXITCODE -ne 0) { throw "PyInstaller упал (код $LASTEXITCODE)" }
-    } else {
-        Write-Output "   список не изменился, второй проход не нужен"
+
+        $licenseFile = "licenses\THIRD-PARTY-LICENSES.txt"
+        $before = if (Test-Path $licenseFile) { (Get-FileHash $licenseFile).Hash } else { "" }
+        Write-Output "== список сторонних лицензий по составу сборки =="
+        & $python tools\collect_licenses.py
+        if ($LASTEXITCODE -ne 0) { throw "collect_licenses упал (код $LASTEXITCODE)" }
+        $after = (Get-FileHash $licenseFile).Hash
+
+        if ($before -ne $after) {
+            Write-Output "== список изменился → PyInstaller (проход 2) =="
+            & $python -m PyInstaller --noconfirm saytype.spec
+            if ($LASTEXITCODE -ne 0) { throw "PyInstaller упал (код $LASTEXITCODE)" }
+        } else {
+            Write-Output "   список не изменился, второй проход не нужен"
+        }
+    } finally {
+        $env:PATH = $buildPath
     }
 }
 if (-not (Test-Path "dist\saytype\saytype.exe")) {
     throw "Нет dist\saytype\saytype.exe — сборка не состоялась"
+}
+
+# Упаковка и публикация запрещены, если frozen-приложение не может загрузить
+# собственные зависимости. Исходниковые pytest этого класса ошибок не видят.
+$selftest = "dist\saytype\saytype-selftest.exe"
+if (-not (Test-Path $selftest)) {
+    throw "Нет $selftest — самопроверка сборки не создана"
+}
+Write-Output "== self-test frozen-сборки =="
+& $selftest
+if ($LASTEXITCODE -ne 0) {
+    throw "self-test frozen-сборки упал (код $LASTEXITCODE) — пакетировать релиз нельзя"
 }
 
 # --- Пакет Velopack ---
