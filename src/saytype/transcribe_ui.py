@@ -2476,7 +2476,10 @@ def run_first_run_wizard(force: bool = False) -> bool:
     from .wizard import FirstRunWizard
 
     dialog = FirstRunWizard(dict(SETTINGS), window)
-    if dialog.exec() != dialog.Accepted:
+    # Код результата принадлежит QDialog, а не экземпляру его подкласса.
+    # У FirstRunWizard нет атрибута Accepted: на чистой установке это падало
+    # сразу после завершения мастера.
+    if dialog.exec() != QDialog.DialogCode.Accepted:
         # Закрыли крестиком — не считаем пройденным, спросим в следующий раз.
         log("мастер первого запуска закрыт без завершения")
         return False
