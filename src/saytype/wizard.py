@@ -243,6 +243,14 @@ class FirstRunWizard(QDialog):
         self.stack.currentChanged.connect(self._on_page_changed)
         self._on_page_changed(0)
 
+        # T-487: при интерфейсе V5 мастер получает его тему; логика шагов прежняя.
+        try:
+            from .ui.legacy_theme import apply_v5_dialog_theme, v5_active
+            if v5_active():
+                apply_v5_dialog_theme(self)
+        except ImportError:
+            pass
+
     # === Шаги ===
     def _build_mic_step(self) -> None:
         page, lay = _step(

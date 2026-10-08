@@ -199,6 +199,30 @@ turns red when the last recording came from a narrowband source. Silence, clips
 shorter than a second and genuinely 16 kHz sources produce no verdict at all — a
 false alarm in the background devalues the real one.
 
+## 14. The interface is a separate layer behind a fixed window contract
+
+`transcribe_ui.py` talks to the window through a narrow contract: the constructor
+arguments, a set of `notify_*` methods (each one only emits a queued Qt signal) and
+three signals back. The V5 interface (`saytype.ui`) implements exactly that contract,
+so recording, hotkeys, paste, tray and transcription are untouched by the redesign.
+The previous window stays in the repository and is selected with `SAYTYPE_UI=legacy`.
+
+The design prototype was HTML, but it is ported to Qt Widgets rather than embedded:
+QtWebEngine would add a Chromium runtime and a JS bridge next to audio capture.
+Digits, icons and the brand mark are the prototype's SVG paths, parsed into
+`QPainterPath` by a small parser (`ui/svgpath.py`) because `QtSvgWidgets` is
+excluded from the build.
+
+All colours, type, grid rhythm, hatching and motion live in `ui/tokens.py`. Only
+visible widgets animate: a hidden window or an inactive page gets values instantly,
+and no timer runs while idle. The recording clock reads a monotonic clock and shows
+the current second; it never replays missed ticks, and its start animation runs
+alongside capture rather than delaying it.
+
+Performance is compared with `tools/bench_matrix.ps1`: both windows alternate in
+blocks over the same core code, model, device, mode and audio, with the window
+rendered on Qt's offscreen platform.
+
 ## Deliberately not done
 
 - **Diarization by model.** Two channels already separate speakers for calls, and

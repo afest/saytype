@@ -594,6 +594,9 @@ def load_settings_dict() -> dict:
         # перевод вынесен в отдельную задачу, а определить язык по локали при
         # первом запуске надо в момент первого запуска, а не задним числом.
         "ui_language": s.value("ui_language", "", type=str) or "",
+        # V5: анимации интерфейса (цифры таймера, переходы страниц). Выключено —
+        # цифры перещёлкиваются, страницы меняются сразу.
+        "ui_animations": _as_bool(s.value("ui_animations", True)),
         # T-404: через какой прокси качать веса. Пусто — как раньше, по
         # настройке Windows. Нужно там, где VPN уводит huggingface.co в
         # маршрут, который его теряет: тогда сюда пишут адрес рабочего
@@ -651,6 +654,8 @@ def save_settings_dict(d: dict) -> None:
         s.setValue("wizard_done", bool(d["wizard_done"]))
     if d.get("ui_language"):
         s.setValue("ui_language", d["ui_language"])
+    if "ui_animations" in d:  # прежнее окно ключа не знает — его «Сохранить» настройку не сбрасывает
+        s.setValue("ui_animations", bool(d["ui_animations"]))
     s.sync()
     if "dictionary" in d:
         profile.save_dictionary(d.get("dictionary") or "")

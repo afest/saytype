@@ -31,6 +31,7 @@ icons/
 _smoke_*
 _bench_*
 _repro_*
+_dev/
 
 # --- audio / transcripts (personal data, must not be committed) ---
 *.wav

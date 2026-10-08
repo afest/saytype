@@ -38,6 +38,7 @@ CHECKS = [
     ("saytype.engine", "saytype.engine"),
     ("saytype.cuda_layer", "saytype.cuda_layer"),
     ("saytype.transcribe_call", "saytype.transcribe_call"),
+    ("saytype.ui.main_window (интерфейс V5)", "saytype.ui.main_window"),
 ]
 
 

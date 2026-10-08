@@ -76,6 +76,11 @@ def resolve_profile_dir() -> Path:
     старая копия и новая начинают расходиться. Переименование либо срабатывает
     целиком, либо не делает ничего — здесь нужно ровно это.
     """
+    # T-487: отдельный профиль для разработки/бенчмарка рядом с рабочим
+    # приложением. Задан явно — ни переезда, ни поиска старой папки.
+    override = os.environ.get("SAYTYPE_PROFILE_DIR", "").strip()
+    if override:
+        return Path(override)
     base = _profile_base()
     target = base / APP_DIR_NAME
     if target.exists():

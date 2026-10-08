@@ -76,6 +76,7 @@ del _threading_init
 from pathlib import Path as _P_init  # noqa: E402
 
 from . import crashguard  # noqa: E402
+from . import single_instance  # noqa: E402
 
 # === SINGLE-INSTANCE CHECK ДО ИМПОРТОВ ===
 # Тяжёлые импорты (PySide6 / faster-whisper / numpy) занимают 5-7 сек.
@@ -90,10 +91,21 @@ if sys.platform == "win32":
     _k32.CreateMutexW.restype = wintypes.HANDLE
     _k32.GetLastError.restype = wintypes.DWORD
     _SINGLE_INSTANCE_NAME = "faster-whisper-ui-singleton-2026-05"
+    # T-487: вторая копия для разработки рядом с рабочей — свой mutex
+    # (вместе с SAYTYPE_PROFILE_DIR и другим hotkey в её settings.ini).
+    import os as _os_init
+    if _os_init.environ.get("SAYTYPE_INSTANCE", "").strip():
+        _SINGLE_INSTANCE_NAME += "-" + _os_init.environ["SAYTYPE_INSTANCE"].strip()
+    del _os_init
     _SINGLE_INSTANCE_HANDLE = _k32.CreateMutexW(None, True, _SINGLE_INSTANCE_NAME)
     if _SINGLE_INSTANCE_HANDLE and _k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        # MessageBoxTimeoutW (undocumented, есть с XP) — auto-dismiss через 5 сек,
-        # чтобы вторая копия не висела, если её никто не закроет
+        # Повторный клик по ярлыку / кнопке на панели задач = «открой окно»:
+        # будим первую копию и молча выходим.
+        if single_instance.request_show(_SINGLE_INSTANCE_NAME):
+            sys.exit(0)
+        # Первая копия события не держит (старая версия до V5) — прежнее
+        # сообщение. MessageBoxTimeoutW (undocumented, есть с XP) — auto-dismiss
+        # через 5 сек, чтобы вторая копия не висела, если её никто не закроет
         try:
             ctypes.windll.user32.MessageBoxTimeoutW(
                 0,
@@ -108,8 +120,12 @@ if sys.platform == "win32":
             pass  # fallback: silent exit
         sys.exit(0)
     # mutex держится через _SINGLE_INSTANCE_HANDLE до конца процесса (при exit ОС освободит)
+    # Событие заводим сразу, ещё до splash: клик во время загрузки не теряется —
+    # оно остаётся взведённым, и окно покажется, как только поднимется слушатель.
+    _SHOW_EVENT_HANDLE = single_instance.create_show_event(_SINGLE_INSTANCE_NAME)
 else:
     _SINGLE_INSTANCE_HANDLE = None
+    _SHOW_EVENT_HANDLE = None
 
 crashguard.start(_runtime_dir())  # мы — единственная копия, маркер наш
 
@@ -129,13 +145,14 @@ try:
     ))
     _splash.resizable(False, False)
     _splash.attributes("-topmost", True)
-    # Заменяем дефолтную «перо»-иконку Tk на наш waveform .ico. Сгенерированный
-    # появляется в профиле только после первого полного старта, поэтому на самом
-    # первом запуске (и в собранной версии) берём эталон из поставки.
+    # Заменяем дефолтную «перо»-иконку Tk на наш .ico. Эталон из поставки —
+    # первым: копия в профиле обновляется только в main(), уже после splash,
+    # и при смене знака показала бы прежний. Профиль — запасной путь, если
+    # пакет поставлен без ассетов (pip).
     from .profile import resource_dir as _resource_dir
-    _ico = _P(_runtime_dir().parent) / "icons" / "saytype.ico"
+    _ico = _resource_dir() / "saytype.ico"
     if not _ico.exists():
-        _ico = _resource_dir() / "saytype.ico"
+        _ico = _P(_runtime_dir().parent) / "icons" / "saytype.ico"
     if _ico.exists():
         try:
             _splash.iconbitmap(str(_ico))
@@ -190,12 +207,25 @@ from PySide6.QtWidgets import QApplication
 
 from .transcribe_ui_window import (
     BusyButton,
-    MainWindow,
     create_autostart_shortcut,
     autostart_shortcut_exists,
     load_settings_dict,
     save_settings_dict,
 )
+from .transcribe_ui_window import MainWindow as _LegacyMainWindow
+
+# T-487: интерфейс V5 живёт в пакете `saytype.ui` и реализует тот же контракт
+# окна (конструктор, notify_*, сигналы). `SAYTYPE_UI=legacy` поднимает прежнее
+# окно из `transcribe_ui_window.py` — для сравнения и парного бенчмарка.
+if os.environ.get("SAYTYPE_UI", "v5").strip().lower() == "legacy":
+    MainWindow = _LegacyMainWindow
+else:
+    try:
+        from .ui.main_window import MainWindow
+    except ModuleNotFoundError as _exc:
+        if _exc.name not in ("saytype.ui", "saytype.ui.main_window"):
+            raise
+        MainWindow = _LegacyMainWindow
 from . import transcribe_ui_window as call_settings  # согласие на запись созвона
 from .hotkeys import (
     MOD_CTRL,
@@ -678,9 +708,20 @@ def ensure_icons() -> dict:
         img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
         _draw_waveform_app(ImageDraw.Draw(img), (31, 31, 35, 255), ICON_SIZE, with_plate=False)
         img.save(paths["app"])
-    # Multi-resolution .ico для ярлыка на рабочем столе — С плашкой,
+    # .ico для ярлыка на рабочем столе — копия эталона из поставки (знак V5,
+    # рисует tools/make_app_icon.py). Сверяем содержимое, а не наличие: иначе
+    # в профиле навсегда осталась бы иконка той версии, что запускалась первой.
+    packaged_ico = profile.resource_dir() / "saytype.ico"
+    if packaged_ico.exists():
+        try:
+            data = packaged_ico.read_bytes()
+            if not paths["app_ico"].exists() or paths["app_ico"].read_bytes() != data:
+                paths["app_ico"].write_bytes(data)
+        except OSError as exc:
+            log(f"app ico copy fail: {exc}")
+    # Без ассетов (пакет из pip) — прежний waveform, multi-resolution, С плашкой,
     # чтобы читалось на любых обоях (тёмные/светлые)
-    if not paths["app_ico"].exists():
+    elif not paths["app_ico"].exists():
         big = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
         _draw_waveform_app(ImageDraw.Draw(big), (31, 31, 35, 255), 256, with_plate=True)
         try:
@@ -693,9 +734,16 @@ def ensure_icons() -> dict:
 
 def _set_taskbar_app_id() -> None:
     """AppUserModelID — Windows связывает иконку с этим ID, чтобы в taskbar
-    показывался наш waveform, а не дефолтная иконка pythonw.exe."""
+    показывался наш знак, а не дефолтная иконка pythonw.exe.
+
+    Dev-копия (SAYTYPE_INSTANCE) получает свой ID: с общим её окно садилось на
+    одну кнопку панели задач с рабочей версией, и версии путались."""
+    app_id = "saytype.app.1"
+    instance = os.environ.get("SAYTYPE_INSTANCE", "").strip()
+    if instance:
+        app_id += "." + instance
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("saytype.app.1")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
 
@@ -707,6 +755,10 @@ def _sync_desktop_shortcut(ico_path: Path) -> None:
     - Уведомить Windows об изменении (SHChangeNotify) — иначе Explorer кеширует
     """
     if sys.platform != "win32" or not ico_path.exists():
+        return
+    # T-487: dev-копия (свой профиль и mutex) живёт рядом с рабочей и не должна
+    # переписывать ярлык пользователя иконкой из временного профиля.
+    if os.environ.get("SAYTYPE_INSTANCE", "").strip():
         return
     desktop = Path.home() / "Desktop"
     old_lnk = desktop / "faster-whisper UI.lnk"
@@ -2875,6 +2927,26 @@ def maybe_offer_cuda_layer() -> None:
     log("CUDA-слой: пользователь отказался — работаем на CPU")
 
 
+class _ShowRequestBridge(QObject):
+    """Просьба второй копии показать окно приходит в фоновом потоке
+    (`single_instance.listen`); сигнал переносит её в GUI-поток."""
+
+    requested = Signal()
+
+    def __init__(self, show) -> None:
+        super().__init__()
+        self._show = show
+        self.requested.connect(self._on_requested)
+
+    @Slot()
+    def _on_requested(self) -> None:
+        log("повторный запуск: показываю окно")
+        self._show()
+
+
+_show_request_bridge: "_ShowRequestBridge | None" = None
+
+
 class _Bridge(QObject):
     """Мост между сигналами MainWindow и hotkey-логикой (Qt main thread)."""
 
@@ -3170,6 +3242,12 @@ def main() -> None:
     window.quit_requested.connect(bridge.on_quit_requested)
     window.stop_sound_requested.connect(bridge.on_stop_sound)
 
+    # Повторный запуск (ярлык, кнопка на панели задач) показывает это окно —
+    # см. single_instance. Ссылка глобальная, чтобы мост не собрал GC.
+    global _show_request_bridge
+    _show_request_bridge = _ShowRequestBridge(window.show_window)
+    single_instance.listen(_SHOW_EVENT_HANDLE, _show_request_bridge.requested.emit)
+
     # T-132: preload модели в фоне — нужна для streaming worker'а с первой записи.
     # OFF-режим грузит лениво при первом стопе (5-7 сек ожидания), preload только
     # ускоряет. Lock внутри engine.load_model() защищает от race c lazy-loader'ом.
@@ -3241,6 +3319,29 @@ def main() -> None:
     _recovery_bridge = _RecoveryBridge()
     _recovery_bridge.offer.connect(_recovery_bridge.on_offer)
     threading.Thread(target=_recovery_scan_worker, daemon=True, name="call-recovery-scan").start()
+
+    # T-487: сценарий автоматизации (бенчмарк, скриншоты) — только по env и
+    # только при запуске из исходников: в собранном приложении переменная
+    # окружения не должна давать способ исполнить чужой код внутри процесса.
+    # Скрипт исполняется в GUI-потоке первым тиком цикла событий и получает
+    # модуль приложения как `app_module`.
+    _bench_path = os.environ.get("SAYTYPE_BENCH", "").strip()
+    if _bench_path and getattr(sys, "frozen", False):
+        log("SAYTYPE_BENCH игнорируется в собранном приложении")
+        _bench_path = ""
+    if _bench_path:
+        def _run_bench_script() -> None:
+            try:
+                code = Path(_bench_path).read_text(encoding="utf-8")
+                exec(  # noqa: S102 — dev-хук, путь задаёт тот, кто запускает
+                    compile(code, _bench_path, "exec"),
+                    {"app_module": sys.modules[__name__], "__name__": "saytype_bench"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                import traceback as _tb
+                log("bench script fail: %r\n%s" % (exc, _tb.format_exc()))
+        log(f"bench script scheduled: {_bench_path}")
+        QTimer.singleShot(0, _run_bench_script)
 
     exit_code = app.exec()
     unregister_hotkey()

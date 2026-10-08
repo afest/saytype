@@ -46,6 +46,14 @@ binaries += collect_dynamic_libs("ctranslate2")
 #    пользователя, а .ico нужен ещё до этого — для splash и для самого exe.
 datas += [("assets/saytype.ico", "assets")]
 
+# 3a. Интерфейс V5 (T-487): заголовочный шрифт Unbounded (OFL, лицензия рядом)
+#     и знак. Шрифт грузится из этой папки при старте — из сети ничего не берётся.
+datas += [
+    ("src/saytype/ui/assets/fonts/Unbounded.ttf", "saytype/ui/assets/fonts"),
+    ("src/saytype/ui/assets/fonts/Unbounded-OFL.txt", "saytype/ui/assets/fonts"),
+    ("src/saytype/ui/assets/mark.svg", "saytype/ui/assets"),
+]
+
 # 4. Тексты лицензий (T-318). Кладутся именно через `datas`, а не «лежат в
 #    репозитории»: обязательство LGPL-3.0 касается того, что человек получил на
 #    руки, а до репозитория он может и не дойти. Собственная MIT-лицензия
@@ -158,6 +166,11 @@ a_selftest = Analysis(
         "pyaudiowpatch", "pyperclip", "saytype.transcribe_call", "saytype.hotkeys",
         "PySide6.QtWidgets", "PySide6.QtMultimedia", "PySide6.QtCharts",
         "scipy.signal", "PIL.Image",
+        # T-487: интерфейс V5. Приложение без него молча откатилось бы на прежнее окно
+        # (запасной путь в transcribe_ui), поэтому самопроверка импортирует его явно.
+        "saytype.ui.main_window", "saytype.ui.pages.capture", "saytype.ui.pages.notes",
+        "saytype.ui.pages.models", "saytype.ui.pages.stats", "saytype.ui.pages.settings",
+        "saytype.ui.pages.about", "saytype.ui.legacy_theme",
     ],
     excludes=excludes,
     # Тот же хук: самопроверка импортирует faster-whisper, а он на уровне модуля

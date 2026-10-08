@@ -73,4 +73,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-saytype = ["assets/*"]
+saytype = ["assets/*", "ui/assets/*", "ui/assets/fonts/*", "ui/README.md"]
