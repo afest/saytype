@@ -96,8 +96,8 @@ Python ставить не нужно, установщик несёт свой.
 
 | Файл | SHA-256 | Отчёт |
 |---|---|---|
-| `saytype-app-win-Setup.exe` | `6559d3eff4e7fe0c1c80bcc2d5d63fb78c139cba77ba7be886989a81115f8286` | [VirusTotal](https://www.virustotal.com/gui/file/6559d3eff4e7fe0c1c80bcc2d5d63fb78c139cba77ba7be886989a81115f8286) |
-| `saytype-app-win-Portable.zip` | `5e1b7727a4cde99a4765434a1173360754d9c8782dde11642c28d21749946d0a` | [VirusTotal](https://www.virustotal.com/gui/file/5e1b7727a4cde99a4765434a1173360754d9c8782dde11642c28d21749946d0a) |
+| `saytype-app-win-Setup.exe` | `2dd4e2a92d1fb94e4448a8547764c5352e2c65ebbc859251dc9f329d05f988cb` | [VirusTotal](https://www.virustotal.com/gui/file/2dd4e2a92d1fb94e4448a8547764c5352e2c65ebbc859251dc9f329d05f988cb) |
+| `saytype-app-win-Portable.zip` | `f7b4fcf3acde8463c2eb9276af8a10a089d5f67f11293a6c4cdf511731e5965b` | [VirusTotal](https://www.virustotal.com/gui/file/f7b4fcf3acde8463c2eb9276af8a10a089d5f67f11293a6c4cdf511731e5965b) |
 
 Прежде чем доверять отчёту, сверьте хеш того, что скачали, — именно он связывает
 одно с другим:
