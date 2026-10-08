@@ -85,6 +85,16 @@ does. The main ones:
 | [Pillow](https://python-pillow.org) | MIT-CMU |
 | [pyperclip](https://github.com/asweigart/pyperclip) | BSD |
 
+## Font
+
+| Component | License |
+|---|---|
+| [Unbounded](https://github.com/googlefonts/unbounded) — heading font of the interface, `saytype/ui/assets/fonts/Unbounded.ttf` | SIL Open Font License 1.1, © 2022 The Unbounded Project Authors |
+
+The font is bundled unmodified; its license text ships next to it
+(`Unbounded-OFL.txt`), which is what OFL 1.1 requires. Icons are drawn from the
+app's own path data (`saytype/ui/icons.py`), not taken from an icon set.
+
 ## NVIDIA CUDA runtime — proprietary, downloaded on demand
 
 The GPU path needs NVIDIA's cuBLAS and the cuDNN loader. They are **not** in the
